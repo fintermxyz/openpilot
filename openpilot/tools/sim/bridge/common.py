@@ -16,6 +16,8 @@ from openpilot.tools.sim.lib.simulated_car import SimulatedCar
 from openpilot.tools.sim.lib.simulated_sensors import SimulatedSensors
 
 QueueMessage = namedtuple("QueueMessage", ["type", "info"], defaults=[None])
+# held driver controls: gas/brake 0..1, steer = keyboard-style torque input (-left), steer_angle = wheel angle command (deg)
+ManualInput = namedtuple("ManualInput", ["gas", "brake", "steer", "steer_angle"])
 
 class QueueMessageType(Enum):
   START_STATUS = 0
@@ -97,6 +99,10 @@ Ignition: {self.simulator_state.ignition} Engaged: {self.simulator_state.is_enga
   def spawn_world(self, q: Queue, /) -> World:
     pass
 
+  def manual_input(self) -> ManualInput | None:
+    """Held driver controls from the simulator's own window, applied every tick (None: keyboard queue pulses only)"""
+    return None
+
   def _run(self, q: Queue):
     self.world = self.spawn_world(q)
 
@@ -159,11 +165,17 @@ Ignition: {self.simulator_state.ignition} Engaged: {self.simulator_state.is_enga
           elif m[0] == "quit":
             break
 
+      manual = self.manual_input()
+      if manual is not None:
+        throttle_manual = max(throttle_manual, manual.gas)
+        brake_manual = max(brake_manual, manual.brake)
+        steer_manual = manual.steer or steer_manual
+
       self.simulator_state.user_brake = brake_manual
       self.simulator_state.user_gas = throttle_manual
       self.simulator_state.user_torque = steer_manual * -10000
 
-      steer_manual = steer_manual * -40
+      steer_manual = manual.steer_angle if manual is not None else steer_manual * -40
 
       # Update openpilot on current sensor state
       self.simulated_sensors.update(self.simulator_state, self.world)

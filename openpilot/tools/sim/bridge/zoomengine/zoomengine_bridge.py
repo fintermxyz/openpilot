@@ -2,7 +2,7 @@ import threading
 import time
 from multiprocessing import Queue
 
-from openpilot.tools.sim.bridge.common import SimulatorBridge, control_cmd_gen
+from openpilot.tools.sim.bridge.common import ManualInput, SimulatorBridge, control_cmd_gen
 from openpilot.tools.sim.bridge.zoomengine.zoomengine_world import ZoomEngineWorld
 
 REENGAGE_AFTER = 3.0  # seconds
@@ -22,6 +22,10 @@ class ZoomEngineBridge(SimulatorBridge):
 
   def spawn_world(self, queue: Queue):
     return ZoomEngineWorld(queue, self.dual_camera, port=self.port, seed=self.seed, traffic=self.traffic, map_path=self.map_path)
+
+  def manual_input(self) -> ManualInput | None:
+    world = self.world
+    return world.manual_input() if isinstance(world, ZoomEngineWorld) else None
 
   def _run(self, q: Queue):
     if self.auto_reengage:

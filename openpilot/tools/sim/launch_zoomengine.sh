@@ -28,5 +28,5 @@ PIDS+=($!)
 PIDS+=($!)
 echo "openpilot log: /tmp/openpilot_zoomengine.log"
 
-# the bridge reads keyboard input from this terminal
+# driving keys are read from the engine window (sim_input); Q there quits
 "$DIR/run_bridge.py" --sim zoomengine --dual_camera --traffic "${TRAFFIC:-heavy}" ${MAP:+--map "$MAP"}
