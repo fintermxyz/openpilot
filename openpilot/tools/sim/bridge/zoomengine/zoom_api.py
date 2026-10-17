@@ -44,16 +44,22 @@ class ZoomAPI:
         time.sleep(0.5)
 
 
+FORMAT_RGB = 1
+FORMAT_NV12 = 2
+
+
 class SensorReader:
-  """Reads the latest RGB frame a ZoomEngine sensor camera writes to shared memory (seqlock protocol)"""
-  def __init__(self, path: str, width: int, height: int):
+  """Reads the latest frame a ZoomEngine sensor camera writes to shared memory (seqlock protocol): RGB8 (H, W, 3),
+  or with nv12_size the NV12 buffer the engine converted on the GPU, already in VisionIPC's layout"""
+  def __init__(self, path: str, width: int, height: int, nv12_size: int = 0):
     self.path = path
     self.width, self.height = width, height
+    self.nv12_size = nv12_size
     self.mm: mmap.mmap | None = None
     self.last_seq = 0
 
   def _open(self) -> bool:
-    size = SHM_HEADER + self.width * self.height * 3
+    size = SHM_HEADER + (self.nv12_size or self.width * self.height * 3)
     if not os.path.exists(self.path) or os.path.getsize(self.path) < size:
       return False
     with open(self.path, "rb") as f:
@@ -61,20 +67,21 @@ class SensorReader:
     return True
 
   def read(self, out: np.ndarray) -> bool:
-    """Copy the newest complete frame into out (H, W, 3). Returns False if there's no new frame."""
+    """Copy the newest complete frame into out ((H, W, 3) RGB, or (nv12_size,) NV12). Returns False if there's no new frame."""
     if self.mm is None and not self._open():
       return False
     assert self.mm is not None
     for _ in range(10):
-      magic, _version, seq0, w, h = struct.unpack_from("<IIQII", self.mm, 0)
-      if magic != SHM_MAGIC or (w, h) != (self.width, self.height):
+      magic, _version, seq0, w, h, _stride, fmt = struct.unpack_from("<IIQIIII", self.mm, 0)
+      if magic != SHM_MAGIC or (w, h) != (self.width, self.height) or fmt != (FORMAT_NV12 if self.nv12_size else FORMAT_RGB):
         return False
       if seq0 & 1:
         time.sleep(0.0005)
         continue
       if seq0 == self.last_seq:
         return False
-      out[:] = np.frombuffer(self.mm, dtype=np.uint8, count=w * h * 3, offset=SHM_HEADER).reshape(h, w, 3)
+      n = self.nv12_size or w * h * 3
+      out.reshape(-1)[:] = np.frombuffer(self.mm, dtype=np.uint8, count=n, offset=SHM_HEADER)
       seq1 = struct.unpack_from("<Q", self.mm, 8)[0]
       if seq1 == seq0:
         self.last_seq = seq0

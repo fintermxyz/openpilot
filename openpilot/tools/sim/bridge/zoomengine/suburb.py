@@ -78,7 +78,7 @@ def suburb_commands(track: Track, rng: np.random.Generator) -> list[dict]:
     kw = {"offset": offset, "roughness": 0.6}
     if dash:
       kw["dash"] = dash
-    ribbon(rid, sd, width, list(color), 0.045, **kw)
+    ribbon(rid, sd, width, list(color), 0.065, **kw)
 
   def along_s(d, s0, s1, step=10.0):
     return [(s, d) for s in np.arange(s0, s1 + 1e-6, step)]
@@ -109,9 +109,9 @@ def suburb_commands(track: Track, rng: np.random.Generator) -> list[dict]:
 
   g_lo, g_hi = CROSS_STREETS_S[0], CROSS_STREETS_S[-1]
   for i, d in enumerate(BACK_STREETS_D):
-    ribbon(f"sub_back{i}", along_s(d, g_lo - STREET_HALF, g_hi + STREET_HALF), 2 * STREET_HALF, ASPHALT, 0.031)
+    ribbon(f"sub_back{i}", along_s(d, g_lo - STREET_HALF, g_hi + STREET_HALF), 2 * STREET_HALF, ASPHALT, 0.035)
   for i, s in enumerate(CROSS_STREETS_S):
-    ribbon(f"sub_cross{i}", along_d(s, COLLECTOR_D, BACK_STREETS_D[-1] + STREET_HALF), 2 * STREET_HALF, ASPHALT, 0.032)
+    ribbon(f"sub_cross{i}", along_d(s, COLLECTOR_D, BACK_STREETS_D[-1] + STREET_HALF), 2 * STREET_HALF, ASPHALT, 0.040)
 
   # ---- sidewalks: one strip per street side, broken at intersections ----
   walk_off = VERGE + SIDEWALK / 2
@@ -120,7 +120,7 @@ def suburb_commands(track: Track, rng: np.random.Generator) -> list[dict]:
   def sidewalk(sd):
     nonlocal n_walk
     if len(sd) > 1:
-      ribbon(f"sub_walk{n_walk}", sd, SIDEWALK, CONCRETE, 0.06, roughness=0.9)
+      ribbon(f"sub_walk{n_walk}", sd, SIDEWALK, CONCRETE, 0.08, roughness=0.9)
       n_walk += 1
 
   cut = STREET_HALF + VERGE + SIDEWALK

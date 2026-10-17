@@ -16,6 +16,7 @@ from openpilot.tools.sim.bridge.zoomengine.traffic import PRESETS, Traffic
 from openpilot.tools.sim.bridge.zoomengine.zoom_api import SensorReader, ZoomAPI
 from openpilot.tools.sim.lib.common import SimulatorState, World, vec3
 from openpilot.tools.sim.lib.camerad import W, H
+from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 
 # the plant is openpilot's own vehicle model of the car launch_openpilot.sh fingerprints as
 CAR_FINGERPRINT = "HONDA_CIVIC_2022"
@@ -80,8 +81,14 @@ class ZoomEngineWorld(World):
     self._reset_ego()
     self._build_scene()
 
-    self.road_reader = SensorReader(SHM_ROAD, W, H)
-    self.wide_reader = SensorReader(SHM_WIDE, W, H) if dual_camera else None
+    # the engine converts to NV12 on the GPU, straight into VisionIPC's layout: no per-frame RGB->YUV here
+    nv12 = get_nv12_info(W, H)
+    self.road_yuv = np.zeros(nv12[3], dtype=np.uint8)
+    self.road_reader = SensorReader(SHM_ROAD, W, H, nv12_size=nv12[3])
+    self.wide_reader = None
+    if dual_camera:
+      self.wide_road_yuv = np.zeros(nv12[3], dtype=np.uint8)
+      self.wide_reader = SensorReader(SHM_WIDE, W, H, nv12_size=nv12[3])
 
     self.sm = messaging.SubMaster(['modelV2', 'selfdriveState', 'carControl', 'carState', 'radarState', 'onroadEvents'])
     self.cam_pos = None
@@ -133,7 +140,7 @@ class ZoomEngineWorld(World):
     pip_w = 0.32
     pip_h = pip_w * H / W * 16 / 9  # keep the camera aspect on a 16:9 window
     cam = {"action": "sensor_camera", "attach": "ego", "offset": [0, CAM_HEIGHT - CAR_Y, CAM_FORWARD], "yaw": 0, "pitch": 0,
-           "width": W, "height": H, "hz": 20}
+           "width": W, "height": H, "hz": 20, "format": "nv12", "nv12": list(get_nv12_info(W, H))}
     api.send({**cam, "id": "road", "hfov": 40, "shm": SHM_ROAD, "pip": [0.67, 0.02, pip_w, pip_h], "label": "road camera (openpilot input)"})
     if self.dual_camera:
       api.send({**cam, "id": "wide", "hfov": 120, "shm": SHM_WIDE, "pip": [0.67, 0.04 + pip_h, pip_w, pip_h],
@@ -273,8 +280,8 @@ class ZoomEngineWorld(World):
 
   def read_cameras(self):
     if self.wide_reader is not None:
-      self.wide_reader.read(self.wide_road_image)
-    if self.road_reader.read(self.road_image):
+      self.wide_reader.read(self.wide_road_yuv)
+    if self.road_reader.read(self.road_yuv):
       self.image_lock.release()  # wakes the camerad thread to send the new frame
 
   def tick(self):

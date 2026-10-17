@@ -89,10 +89,10 @@ def road_commands(track: Track) -> list[dict]:
     # shoulders: 1 m on the median side, 2.5 m on the outside
     inner, outer = center - sign * (EDGE + 1.0), center + sign * (EDGE + 2.5)
     ribbon(f"{name}_asphalt", 0.5 * (inner + outer), abs(outer - inner), [0.11, 0.11, 0.115], y=0.01, **asphalt)
-    ribbon(f"{name}_edge_yellow", center - sign * EDGE, 0.15, [0.85, 0.65, 0.1], y=0.02, roughness=0.6)
-    ribbon(f"{name}_edge_white", center + sign * EDGE, 0.15, [0.9, 0.9, 0.9], y=0.02, roughness=0.6)
+    ribbon(f"{name}_edge_yellow", center - sign * EDGE, 0.15, [0.85, 0.65, 0.1], y=0.05, roughness=0.6)
+    ribbon(f"{name}_edge_white", center + sign * EDGE, 0.15, [0.9, 0.9, 0.9], y=0.05, roughness=0.6)
     for j, dl in enumerate((-0.5, 0.5)):
-      ribbon(f"{name}_dash{j}", center + dl * LANE_WIDTH, 0.12, [0.9, 0.9, 0.9], y=0.02, dash=[3.0, 9.0], roughness=0.6)
+      ribbon(f"{name}_dash{j}", center + dl * LANE_WIDTH, 0.12, [0.9, 0.9, 0.9], y=0.05, dash=[3.0, 9.0], roughness=0.6)
   ribbon("median", 0.5 * OPPOSING_D, 6.0, [0.18, 0.3, 0.12], y=0.005, roughness=1.0)
   return cmds
 

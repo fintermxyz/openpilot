@@ -173,7 +173,7 @@ class BeamngMap:
       for s in np.arange(0.0, track.length + 1.5, 3.0):
         x, z, _ = track.pose(float(s), d)
         h = self.surface.height(x, z)
-        pts.append([round(x, 3), round((track.height(float(s)) if h is None else h) + 0.04, 3), round(z, 3)])
+        pts.append([round(x, 3), round((track.height(float(s)) if h is None else h) + 0.06, 3), round(z, 3)])
       cmd = {"action": "create", "type": "ribbon", "id": f"mark_{tag}_{lid}", "points": pts,
              "width": width, "color": [0.92, 0.92, 0.9], "roughness": 0.6}
       if dash:

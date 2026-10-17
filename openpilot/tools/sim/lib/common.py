@@ -68,6 +68,9 @@ class World(ABC):
     self.image_lock = multiprocessing.Semaphore(value=0)
     self.road_image = np.zeros((H, W, 3), dtype=np.uint8)
     self.wide_road_image = np.zeros((H, W, 3), dtype=np.uint8)
+    # simulators that render NV12 themselves (e.g. ZoomEngine converts on the GPU) set these and skip rgb_to_yuv
+    self.road_yuv: np.ndarray | None = None
+    self.wide_road_yuv: np.ndarray | None = None
 
     self.exit_event = multiprocessing.Event()
 
