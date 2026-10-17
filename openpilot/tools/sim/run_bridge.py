@@ -5,12 +5,12 @@ from typing import Any
 from multiprocessing import Queue
 
 
-def create_bridge(dual_camera, high_quality, sim="metadrive", traffic="heavy"):
+def create_bridge(dual_camera, high_quality, sim="metadrive", traffic="heavy", map_path=None):
   queue: Any = Queue()
 
   if sim == "zoomengine":
     from openpilot.tools.sim.bridge.zoomengine.zoomengine_bridge import ZoomEngineBridge
-    simulator_bridge = ZoomEngineBridge(dual_camera, high_quality, traffic)
+    simulator_bridge = ZoomEngineBridge(dual_camera, high_quality, traffic, map_path)
   else:
     from openpilot.tools.sim.bridge.metadrive.metadrive_bridge import MetaDriveBridge
     simulator_bridge = MetaDriveBridge(dual_camera, high_quality)
@@ -29,13 +29,14 @@ def parse_args(add_args=None):
   parser.add_argument('--dual_camera', action='store_true')
   parser.add_argument('--sim', choices=['metadrive', 'zoomengine'], default='metadrive')
   parser.add_argument('--traffic', choices=['light', 'heavy', 'chaos'], default='heavy', help='zoomengine traffic difficulty')
+  parser.add_argument('--map', help='zoomengine: level.json of a BeamNG level converted with ZoomEngine tools/beamng_import.py')
 
   return parser.parse_args(add_args)
 
 if __name__ == "__main__":
   args = parse_args()
 
-  queue, simulator_process, simulator_bridge = create_bridge(args.dual_camera, args.high_quality, args.sim, args.traffic)
+  queue, simulator_process, simulator_bridge = create_bridge(args.dual_camera, args.high_quality, args.sim, args.traffic, args.map)
 
   if args.joystick:
     # start input poll for joystick

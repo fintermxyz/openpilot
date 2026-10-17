@@ -11,15 +11,17 @@ REENGAGE_AFTER = 3.0  # seconds
 class ZoomEngineBridge(SimulatorBridge):
   TICKS_PER_FRAME = 5
 
-  def __init__(self, dual_camera, high_quality, traffic: str = "heavy", port: int = 9090, seed: int = 0, auto_reengage: bool = True):
+  def __init__(self, dual_camera, high_quality, traffic: str = "heavy", map_path: str | None = None, port: int = 9090, seed: int = 0,
+               auto_reengage: bool = True):
     super().__init__(dual_camera, high_quality)
     self.traffic = traffic
+    self.map_path = map_path
     self.port = port
     self.seed = seed
     self.auto_reengage = auto_reengage
 
   def spawn_world(self, queue: Queue):
-    return ZoomEngineWorld(queue, self.dual_camera, port=self.port, seed=self.seed, traffic=self.traffic)
+    return ZoomEngineWorld(queue, self.dual_camera, port=self.port, seed=self.seed, traffic=self.traffic, map_path=self.map_path)
 
   def _run(self, q: Queue):
     if self.auto_reengage:

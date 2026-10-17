@@ -8,9 +8,10 @@ from opendbc.car.honda.interface import CarInterface
 from opendbc.car.vehicle_model import VehicleModel
 from openpilot.cereal import messaging
 from openpilot.tools.sim.bridge.common import QueueMessage, QueueMessageType
-from openpilot.tools.sim.bridge.zoomengine.scene import CAR_Y, car_commands, deg, props_commands, road_commands
+from openpilot.tools.sim.bridge.zoomengine.beamng_map import BeamngMap
+from openpilot.tools.sim.bridge.zoomengine.scene import CAR_Y, car_commands, car_rotation, props_commands, road_commands
 from openpilot.tools.sim.bridge.zoomengine.track import Track
-from openpilot.tools.sim.bridge.zoomengine.traffic import Traffic
+from openpilot.tools.sim.bridge.zoomengine.traffic import PRESETS, Traffic
 from openpilot.tools.sim.bridge.zoomengine.zoom_api import SensorReader, ZoomAPI
 from openpilot.tools.sim.lib.common import SimulatorState, World, vec3
 from openpilot.tools.sim.lib.camerad import W, H
@@ -32,7 +33,8 @@ ENGINE_HZ = 50
 
 
 class ZoomEngineWorld(World):
-  def __init__(self, status_q, dual_camera: bool, port: int = 9090, seed: int = 0, traffic: str = "heavy", chase_camera: bool = True):
+  def __init__(self, status_q, dual_camera: bool, port: int = 9090, seed: int = 0, traffic: str = "heavy", chase_camera: bool = True,
+               map_path: str | None = None):
     super().__init__(dual_camera)
     self.status_q = status_q
     self.chase_camera = chase_camera
@@ -43,10 +45,23 @@ class ZoomEngineWorld(World):
     self.api.wait_ready()
 
     self.VM = VehicleModel(CarInterface.get_non_essential_params(CAR_FINGERPRINT))
-    self.track = Track()
     self.lock = threading.Lock()
     self.rng = np.random.default_rng(seed)
-    self.traffic = Traffic(self.track, self.rng, EGO_START_S, traffic)
+    self.map = BeamngMap(map_path) if map_path else None
+    self.opp_traffic = None
+    if self.map is not None:
+      # BeamNG level: drive its Autobahn in the right lane, the other carriageway gets its own traffic
+      self.track = self.map.track
+      lanes = self.map.lane_offsets
+      self.ego_start_d = lanes[-1]
+      self.traffic = Traffic(self.track, self.rng, EGO_START_S, traffic, lanes=lanes, n_opposing=0, ego_lane=len(lanes) - 1)
+      if self.map.opposing_track is not None:
+        self.opp_traffic = Traffic(self.map.opposing_track, self.rng, 0.0, traffic, lanes=lanes, closure=False,
+                                   n_same=PRESETS[traffic].n_opposing, n_opposing=0, prefix="opp", ego_lane=None)
+    else:
+      self.track = Track()
+      self.ego_start_d = 0.0
+      self.traffic = Traffic(self.track, self.rng, EGO_START_S, traffic)
     self._reset_ego()
     self._build_scene()
 
@@ -74,10 +89,14 @@ class ZoomEngineWorld(World):
     api.send({"action": "clear"})
     for cam_id in ("road", "wide"):
       api.send({"action": "sensor_camera_remove", "id": cam_id})
-    cmds = road_commands(self.track) + props_commands(self.track, self.rng) + self.traffic.create_commands()
-    x, z, psi = self.ego_x, self.ego_z, self.ego_psi
-    cmds += car_commands("ego", "sedan", [0.92, 0.93, 0.95], x, z, psi, sensor_hidden=True)
-    api.batch(cmds)
+    scene = self.map.scene_commands() if self.map is not None else road_commands(self.track) + props_commands(self.track, self.rng)
+    cmds = scene + self.traffic.create_commands()
+    if self.opp_traffic is not None:
+      cmds += self.opp_traffic.create_commands()
+    y, rot = self._ego_height_rotation(self.ego_s, self.ego_psi)
+    cmds += car_commands("ego", "sedan", [0.92, 0.93, 0.95], self.ego_x, self.ego_z, self.ego_psi, sensor_hidden=True,
+                         y0=y, rotation=rot)
+    api.batch(cmds, chunk=200)
 
     pip_w = 0.32
     pip_h = pip_w * H / W * 16 / 9  # keep the camera aspect on a 16:9 window
@@ -87,34 +106,56 @@ class ZoomEngineWorld(World):
     if self.dual_camera:
       api.send({**cam, "id": "wide", "hfov": 120, "shm": SHM_WIDE, "pip": [0.67, 0.04 + pip_h, pip_w, pip_h],
                 "label": "wide camera (openpilot input)"})
-    print(f"---- ZoomEngine scene built: {len(cmds)} objects, track {self.track.length:.0f} m ----")
+    name = self.map.name if self.map is not None else "highway loop"
+    print(f"---- ZoomEngine scene built ({name}): {len(cmds)} objects, track {self.track.length:.0f} m ----")
+
+  def _ego_height_rotation(self, s: float, psi: float) -> tuple[float, list[float]]:
+    return self.track.height(s) + CAR_Y, car_rotation(psi, self.track.pitch(s))
 
   def _reset_ego(self):
     with self.lock:
-      self.ego_x, self.ego_z, self.ego_psi = self.track.pose(EGO_START_S, 0.0)
+      self.ego_x, self.ego_z, self.ego_psi = self.track.pose(EGO_START_S, self.ego_start_d)
       self.ego_v = EGO_START_SPEED
       self.ego_yaw_rate = 0.0
       self.ego_accel = 0.0
       self.steer_deg = 0.0
       self.steer_cmd = 0.0
       self.accel_cmd = 0.0
-      self.ego_s, self.ego_d = EGO_START_S, 0.0
+      self.ego_s, self.ego_d = EGO_START_S, self.ego_start_d
+      self.op_active = False
+      self.ego_pitch = self.track.pitch(EGO_START_S)
       self.last_t = time.monotonic()
       self.reset_time = self.last_t
 
   # ---- vehicle ----
+  def _driver_steer(self) -> float:
+    """steering wheel angle [deg] a human driver would use to hold the current lane (pure pursuit)"""
+    lanes = self.traffic.lanes
+    lane_d = min(lanes, key=lambda d: abs(d - self.ego_d))
+    lookahead = max(12.0, 1.3 * self.ego_v)
+    tx, tz, _ = self.track.pose(self.ego_s + lookahead, lane_d)
+    alpha = math.atan2(tx - self.ego_x, tz - self.ego_z) - self.ego_psi
+    alpha = (alpha + math.pi) % (2 * math.pi) - math.pi
+    curvature = 2.0 * math.sin(alpha) / lookahead
+    return math.degrees(self.VM.get_steer_from_curvature(curvature, max(self.ego_v, 1.0), 0.0))
+
   def apply_controls(self, steer_angle, throttle_out, brake_out):
     with self.lock:
       now = time.monotonic()
       dt = min(0.05, now - self.last_t)
       self.last_t = now
+      # while openpilot isn't engaged and nobody steers manually, the driver holds the lane
+      if not self.op_active and abs(steer_angle) < 1e-6:
+        steer_angle = self._driver_steer()
       self.steer_cmd = float(steer_angle)
       self.accel_cmd = 1.6 * float(throttle_out) - 4.0 * float(brake_out)
 
       self.steer_deg += float(np.clip(self.steer_cmd - self.steer_deg, -STEER_RATE * dt, STEER_RATE * dt))
       v = self.ego_v
       drag = 0.02 + 0.0004 * v * v if v > 0.1 else 0.0
-      self.ego_v = max(0.0, v + (self.accel_cmd - drag) * dt)
+      self.ego_pitch = self.track.pitch(self.ego_s)
+      grade = GRAVITY * math.sin(self.ego_pitch) if v > 0.1 or self.accel_cmd > 0 else 0.0  # parked cars don't roll back
+      self.ego_v = max(0.0, v + (self.accel_cmd - drag - grade) * dt)
       self.ego_accel = (self.ego_v - v) / dt if dt > 0 else 0.0
       self.ego_yaw_rate = self.ego_v * self.VM.calc_curvature(math.radians(self.steer_deg), self.ego_v, 0.0)
       self.ego_psi += self.ego_yaw_rate * dt
@@ -134,7 +175,9 @@ class ZoomEngineWorld(World):
       state.steering_angle = self.steer_deg
       # raw IMU axes as locationd expects them: device frame (x fwd, y right, z down) = [-v[2], -v[1], -v[0]]
       state.imu.gyroscope = vec3(self.ego_yaw_rate, 0.0, 0.0)
-      state.imu.accelerometer = vec3(GRAVITY, v * self.ego_yaw_rate, -self.ego_accel)
+      # specific force: gravity tilts into the forward axis on hills
+      p = self.ego_pitch
+      state.imu.accelerometer = vec3(GRAVITY * math.cos(p), v * self.ego_yaw_rate, -(self.ego_accel + GRAVITY * math.sin(p)))
       state.gps.from_xy((self.ego_z, -self.ego_x))  # north = +z, east = -x
       state.valid = True
 
@@ -168,10 +211,16 @@ class ZoomEngineWorld(World):
       with self.lock:
         ego = (self.ego_x, self.ego_z, self.ego_psi, self.ego_v, self.ego_s, self.ego_d)
       self.traffic.step(dt, (ego[4], ego[5], ego[3]))
+      if self.opp_traffic is not None:
+        self.opp_traffic.step(dt, None)
 
-      cmds = self.traffic.engine_commands(ego[4], frame)
-      cmds.append({"action": "move", "id": "ego", "position": [round(ego[0], 3), CAR_Y, round(ego[1], 3)]})
-      cmds.append({"action": "rotate", "id": "ego", "rotation": [0, deg(ego[2]), 0]})
+      cmds = self.traffic.engine_commands((ego[0], ego[1]), frame)
+      if self.opp_traffic is not None:
+        cmds += self.opp_traffic.engine_commands((ego[0], ego[1]), frame)
+      y, rot = self._ego_height_rotation(ego[4], ego[2])
+      # "smooth": the engine glides between these 50 Hz samples, so the view doesn't stutter at 60-120 fps
+      cmds.append({"action": "move", "id": "ego", "position": [round(ego[0], 3), round(y, 3), round(ego[1], 3)], "smooth": True})
+      cmds.append({"action": "rotate", "id": "ego", "rotation": rot, "smooth": True})
       if self.chase_camera:
         cmds.append(self._chase_camera(ego, dt))
       if frame % 2 == 0:
@@ -198,11 +247,13 @@ class ZoomEngineWorld(World):
 
   def _chase_camera(self, ego, dt):
     x, z, psi = ego[0], ego[1], ego[2]
+    h = self.track.height(ego[4])
     fx, fz = math.sin(psi), math.cos(psi)
-    want = np.array([x - 11.0 * fx, 4.2, z - 11.0 * fz])
+    want = np.array([x - 11.0 * fx, h + 4.2, z - 11.0 * fz])
     a = 1.0 - math.exp(-dt * 4.0)
     self.cam_pos = want if self.cam_pos is None else self.cam_pos + a * (want - self.cam_pos)
-    return {"action": "camera", "position": [round(float(c), 3) for c in self.cam_pos], "target": [x + 10.0 * fx, 1.2, z + 10.0 * fz]}
+    return {"action": "camera", "position": [round(float(c), 3) for c in self.cam_pos], "target": [x + 10.0 * fx, h + 1.2, z + 10.0 * fz],
+            "smooth": True}
 
   @staticmethod
   def _to_ego(x, y, max_x=None):
@@ -269,6 +320,7 @@ class ZoomEngineWorld(World):
 
   def _track_engagement(self, ego) -> None:
     active = self.sm['selfdriveState'].active
+    self.op_active = active
     if self.was_active and not active:
       events = self.sm['onroadEvents']
       self.disengagements += 1

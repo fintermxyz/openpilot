@@ -67,6 +67,16 @@ Traffic presets (`--traffic`):
 | heavy  | 78   | aggressive drivers, cut-ins, phantom braking, the car ahead brake-checking every ~45 s, a lane closure with zipper merges |
 | chaos  | 124  | everything in heavy, more often and with more aggressive drivers |
 
+### BeamNG levels
+
+Convert a BeamNG level with ZoomEngine's `tools/beamng_import.py` (needs `brew install assimp`) and drive its Autobahn
+(its AI roads become the track, heights come from the road meshes, lane markings and trees are generated):
+
+``` bash
+python3 <ZoomEngine>/tools/beamng_import.py <extracted mod>/levels/<level> --out <ZoomEngine>/imports/beamng/<level>
+MAP=<ZoomEngine>/imports/beamng/<level>/level.json TRAFFIC=chaos ./openpilot/tools/sim/launch_zoomengine.sh
+```
+
 The bridge logs a status line every second, every disengagement with its cause and every collision with who caused it
 (`ego` rear-ended someone, an `npc` rear-ended ego, or a `cut-in`). If openpilot drops out on its own it is re-engaged
 after 3 s, like an attentive driver would.

@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from openpilot.tools.sim.bridge.zoomengine.scene import CAR_COLORS, EDGE, KINDS, OPPOSING_D, car_commands, deg
+from openpilot.tools.sim.bridge.zoomengine.scene import CAR_COLORS, KINDS, OPPOSING_D, car_commands, car_rotation, deg
 from openpilot.tools.sim.bridge.zoomengine.track import LANE_WIDTH, Track
 
 LANE_OFFSETS = (-LANE_WIDTH, 0.0, LANE_WIDTH)
@@ -30,7 +30,6 @@ PRESETS = {
 }
 
 # right lane closure on the second long straight, cones taper over the first 100 m
-CLOSURE_LANE = 2
 CLOSURE_TAPER_S = 3200.0
 CLOSURE_START_S = 3300.0
 CLOSURE_END_S = 3650.0
@@ -67,13 +66,15 @@ class Car:
   cooldown: float = 0.0
   brake_until_v: float = -1.0  # hard braking event: brake until below this speed
   brake_hold: float = 0.0
+  lanes: tuple = LANE_OFFSETS
+  opposing_d: float = OPPOSING_D
 
   @property
   def half_length(self) -> float:
     return KINDS[self.kind][2]
 
   def lane_d(self, lane: int) -> float:
-    return OPPOSING_D - LANE_OFFSETS[lane] if self.opposing else LANE_OFFSETS[lane]
+    return self.opposing_d - self.lanes[lane] if self.opposing else self.lanes[lane]
 
 
 def idm(v: float, v0: float, gap: float, dv: float, drv: Driver) -> float:
@@ -82,28 +83,41 @@ def idm(v: float, v0: float, gap: float, dv: float, drv: Driver) -> float:
 
 
 class Traffic:
-  """NPC traffic on both carriageways: IDM car following, lane changes, cut-ins, hard braking and a lane closure.
-  Ego is part of the traffic, NPCs follow it and cut in front of it."""
-  def __init__(self, track: Track, rng: np.random.Generator, ego_s: float, preset: str = "heavy"):
+  """NPC traffic: IDM car following, lane changes, cut-ins, hard braking and a lane closure. Ego is part of the traffic,
+  NPCs follow it and cut in front of it. Opposing cars drive the same track backwards at `opposing_d`; a carriageway
+  that has its own track gets its own Traffic with ego_lane=None (no ego interaction)."""
+  def __init__(self, track: Track, rng: np.random.Generator, ego_s: float, preset: str = "heavy", lanes: tuple = LANE_OFFSETS,
+               opposing_d: float = OPPOSING_D, closure: bool | None = None, n_same: int | None = None, n_opposing: int | None = None,
+               prefix: str = "npc", ego_lane: int | None = 1):
     self.track = track
     self.rng = rng
     self.preset = PRESETS[preset]
     self.preset_name = preset
+    self.lanes = tuple(lanes)
+    self.opposing_d = opposing_d
+    self.closure = self.preset.closure if closure is None else closure
+    self.closure_lane = len(self.lanes) - 1
+    self.ego_interaction = ego_lane is not None
     self.cars: list[Car] = []
     self.t = 0.0
     self.next_brake_check = self.preset.brake_check_period or FAR
     self.stats = {"cut_ins": 0, "hard_brakes": 0, "brake_checks": 0, "merges": 0}
     kinds = ["sedan"] * 6 + ["suv"] * 3 + ["truck"]
     p = self.preset
+    n_same = p.n_same if n_same is None else n_same
+    n_opposing = p.n_opposing if n_opposing is None else n_opposing
+    n_lanes = len(self.lanes)
 
-    # a lead car right in front of ego so openpilot has something to follow immediately
-    self._add("npc0", "sedan", False, ego_s + 45.0, 1, 20.0, 23.0, aggressive=False)
-    placed = [(ego_s, 1), (ego_s + 45.0, 1)]
-    for i in range(1, p.n_same):
+    placed = []
+    if ego_lane is not None:
+      # a lead car right in front of ego so openpilot has something to follow immediately
+      self._add(f"{prefix}0", "sedan", False, ego_s + 45.0, ego_lane, 20.0, 23.0, aggressive=False)
+      placed = [(ego_s, ego_lane), (ego_s + 45.0, ego_lane)]
+    for i in range(1 if placed else 0, n_same):
       for _ in range(50):
         s = float(rng.uniform(0, track.length))
-        lane = int(rng.integers(0, 3))
-        if self._closed(s, lane) or (self._ds(s, ego_s) > -40 and self._ds(s, ego_s) < 60):
+        lane = int(rng.integers(0, n_lanes))
+        if self._closed(s, lane) or (ego_lane is not None and -40 < self._ds(s, ego_s) < 60):
           continue
         if all(lane != pl or abs(self._ds(s, ps)) > 25 for ps, pl in placed):
           break
@@ -111,11 +125,11 @@ class Traffic:
       kind = str(rng.choice(kinds))
       aggressive = kind != "truck" and rng.random() < p.aggressive_frac
       v_des = 21.0 if kind == "truck" else float(rng.uniform(22.0, 30.0) - lane * 1.5 + (4.0 if aggressive else 0.0))
-      self._add(f"npc{i}", kind, False, s, lane, v_des * 0.85, v_des, aggressive)
-    spacing = track.length / p.n_opposing
-    for i in range(p.n_opposing):
+      self._add(f"{prefix}{i}", kind, False, s, lane, v_des * 0.85, v_des, aggressive)
+    spacing = track.length / max(1, n_opposing)
+    for i in range(n_opposing):
       kind = str(rng.choice(kinds))
-      self._add(f"opp{i}", kind, True, i * spacing + rng.uniform(-0.3, 0.3) * spacing, int(rng.integers(0, 3)), 25.0,
+      self._add(f"{prefix}opp{i}", kind, True, i * spacing + rng.uniform(-0.3, 0.3) * spacing, int(rng.integers(0, n_lanes)), 25.0,
                 float(rng.uniform(23.0, 31.0)), rng.random() < p.aggressive_frac)
 
   def _driver(self, aggressive: bool) -> Driver:
@@ -125,7 +139,8 @@ class Traffic:
                   float(self.rng.uniform(7.0, 12.0)), float(self.rng.uniform(5.0, 9.0)), float(self.rng.uniform(2.0, 2.8)))
 
   def _add(self, cid, kind, opposing, s, lane, v, v_des, aggressive):
-    car = Car(cid, kind, opposing, s % self.track.length, lane, v, v_des, self._driver(aggressive), aggressive)
+    car = Car(cid, kind, opposing, s % self.track.length, lane, v, v_des, self._driver(aggressive), aggressive,
+              lanes=self.lanes, opposing_d=self.opposing_d)
     car.d = car.d_from = car.lane_d(lane)
     self.cars.append(car)
 
@@ -134,39 +149,45 @@ class Traffic:
     return (a - b + self.track.length / 2) % self.track.length - self.track.length / 2
 
   def _closed(self, s: float, lane: int) -> bool:
-    return self.preset.closure and lane == CLOSURE_LANE and CLOSURE_TAPER_S - 20 <= s % self.track.length <= CLOSURE_END_S
+    return self.closure and lane == self.closure_lane and CLOSURE_TAPER_S - 20 <= s % self.track.length <= CLOSURE_END_S
 
   # ---- engine objects ----
   def create_commands(self) -> list[dict]:
     cmds = []
     for i, car in enumerate(self.cars):
-      x, z, psi = self.pose(car)
+      x, y, z, rot = self.pose3d(car)
       color = [0.92, 0.92, 0.9] if car.kind == "truck" else CAR_COLORS[i % len(CAR_COLORS)]
-      cmds += car_commands(car.cid, car.kind, color, x, z, psi)
-    if self.preset.closure:
+      cmds += car_commands(car.cid, car.kind, color, x, z, 0.0, y0=y, rotation=rot)
+    if self.closure:
       cmds += self._closure_commands()
     return cmds
 
   def _closure_commands(self) -> list[dict]:
     cmds = []
+    lane_w = self.lanes[1] - self.lanes[0]
+    edge = self.lanes[-1] + lane_w / 2          # right edge of the closed lane
+    line = self.lanes[-1] - lane_w / 2          # line between it and the next lane
     s, i = CLOSURE_TAPER_S, 0
     while s <= CLOSURE_END_S:
       u = min(1.0, (s - CLOSURE_TAPER_S) / (CLOSURE_START_S - CLOSURE_TAPER_S))
-      d = EDGE + 0.6 + u * (LANE_WIDTH * 0.5 + 0.3 - EDGE - 0.6)  # ends just right of the middle lane's line
+      d = edge + 0.6 + u * (line + 0.3 - edge - 0.6)  # taper ends just right of the open lane's line
       x, z, _ = self.track.pose(s, d)
-      cmds.append({"action": "create", "type": "cone", "id": f"cone{i}", "position": [x, 0.38, z], "radius": 0.22, "height": 0.75,
+      cmds.append({"action": "create", "type": "cone", "id": f"cone{i}", "position": [x, self.track.height(s) + 0.38, z],
+                   "radius": 0.22, "height": 0.75,
                    "segments": 12, "color": [1.0, 0.35, 0.0], "emissive": [0.6, 0.15, 0.0], "roughness": 0.6})
       s += 6.0 if u < 1.0 else 12.0
       i += 1
     for k, s in enumerate((CLOSURE_TAPER_S - 250.0, CLOSURE_TAPER_S - 20.0)):
-      x, z, psi = self.track.pose(s, EDGE + 1.6)
-      cmds.append({"action": "create", "type": "cube", "id": f"closure_sign{k}", "position": [x, 1.2, z],
+      x, z, psi = self.track.pose(s, edge + 1.6)
+      h = self.track.height(s)
+      cmds.append({"action": "create", "type": "cube", "id": f"closure_sign{k}", "position": [x, h + 1.2, z],
                    "rotation": [0, deg(psi + math.pi / 4), 45], "scale": [0.6, 0.6, 0.03], "color": [1.0, 0.5, 0.0],
                    "emissive": [0.5, 0.25, 0.0]})
-      cmds.append({"action": "create", "type": "cylinder", "id": f"closure_post{k}", "position": [x, 0.4, z], "radius": 0.04,
+      cmds.append({"action": "create", "type": "cylinder", "id": f"closure_post{k}", "position": [x, h + 0.4, z], "radius": 0.04,
                    "height": 0.8, "color": [0.4, 0.4, 0.4]})
-    x, z, psi = self.track.pose(CLOSURE_START_S + 30.0, LANE_WIDTH + 0.2)
-    cmds.append({"action": "create", "type": "cube", "id": "closure_truck", "position": [x, 1.3, z], "rotation": [0, deg(psi), 0],
+    x, z, psi = self.track.pose(CLOSURE_START_S + 30.0, self.lanes[-1] + 0.2)
+    h = self.track.height(CLOSURE_START_S + 30.0)
+    cmds.append({"action": "create", "type": "cube", "id": "closure_truck", "position": [x, h + 1.3, z], "rotation": [0, deg(psi), 0],
                  "scale": [1.2, 1.3, 3.5], "color": [1.0, 0.55, 0.05], "emissive": [0.3, 0.12, 0.0], "roughness": 0.5})
     return cmds
 
@@ -181,15 +202,21 @@ class Traffic:
       psi -= math.atan2(lat_v, max(car.v, 1.0)) * (-1 if car.opposing else 1)
     return x, z, psi
 
-  def engine_commands(self, ego_s: float, frame: int) -> list[dict]:
-    """poses for all cars, far away cars only every 5th frame to keep the API traffic down"""
+  def pose3d(self, car: Car) -> tuple[float, float, float, list[float]]:
+    """(x, body center height, z, engine rotation) with the car pitched along the road"""
+    x, z, psi = self.pose(car)
+    pitch = self.track.pitch(car.s) * (-1 if car.opposing else 1)
+    return x, self.track.height(car.s) + KINDS[car.kind][3], z, car_rotation(psi, pitch)
+
+  def engine_commands(self, ego_xz: tuple[float, float], frame: int) -> list[dict]:
+    """poses for all cars, ones further than 400 m from ego only every 5th frame to keep the API traffic down"""
     cmds = []
     for car in self.cars:
-      if frame % 5 and abs(self._ds(car.s, ego_s)) > 400.0:
+      x, y, z, rot = self.pose3d(car)
+      if frame % 5 and (x - ego_xz[0]) ** 2 + (z - ego_xz[1]) ** 2 > 400.0 ** 2:
         continue
-      x, z, psi = self.pose(car)
-      cmds.append({"action": "move", "id": car.cid, "position": [round(x, 3), KINDS[car.kind][3], round(z, 3)]})
-      cmds.append({"action": "rotate", "id": car.cid, "rotation": [0, deg(psi), 0]})
+      cmds.append({"action": "move", "id": car.cid, "position": [round(x, 3), round(y, 3), round(z, 3)], "smooth": True})
+      cmds.append({"action": "rotate", "id": car.cid, "rotation": rot, "smooth": True})
     return cmds
 
   # ---- simulation ----
@@ -219,7 +246,7 @@ class Traffic:
         if gap - car.half_length - EGO_HALF_LENGTH < best_gap:
           best_gap, best_v = gap - car.half_length - EGO_HALF_LENGTH, ego[2]
       # the closure acts like a stopped car at the start of the taper
-      if not behind and self.preset.closure and abs(car.lane_d(CLOSURE_LANE) - lane_d) < 1.0:
+      if not behind and self.closure and abs(car.lane_d(self.closure_lane) - lane_d) < 1.0:
         gap = self._ds(CLOSURE_TAPER_S, car.s)
         if 0 < gap - car.half_length < best_gap:
           best_gap, best_v = gap - car.half_length, 0.0
@@ -229,7 +256,7 @@ class Traffic:
     car.lane, car.d_from, car.lc_t, car.cooldown = target, car.d, 0.0, 6.0 if car.aggressive else 15.0
 
   def _try_lane_change(self, car: Car, target: int, ego, scale: float = 1.0) -> bool:
-    if not 0 <= target < 3 or (not car.opposing and self._closed(car.s + 60.0, target)):
+    if not 0 <= target < len(self.lanes) or (not car.opposing and self._closed(car.s + 60.0, target)):
       return False
     td = car.lane_d(target)
     ahead, v_ahead = self._leader(car, td, ego)
@@ -241,11 +268,13 @@ class Traffic:
       return True
     return False
 
-  def step(self, dt: float, ego: tuple[float, float, float]) -> None:
-    """ego: (s, d, speed) on the track"""
+  def step(self, dt: float, ego: tuple[float, float, float] | None) -> None:
+    """ego: (s, d, speed) on the track, None when ego isn't on this track"""
+    if ego is None:
+      ego = (0.0, FAR, 0.0)
     p = self.preset
     self.t += dt
-    ego_lane = min(range(3), key=lambda i: abs(LANE_OFFSETS[i] - ego[1]))
+    ego_lane = min(range(len(self.lanes)), key=lambda i: abs(self.lanes[i] - ego[1]))
 
     # brake check: the car directly ahead of ego slams on the brakes
     if self.t >= self.next_brake_check:
@@ -290,9 +319,9 @@ class Traffic:
         continue
 
       # forced merge out of the closed lane: zipper, accepting ever smaller gaps closer to the cones
-      if not car.opposing and p.closure and car.lane == CLOSURE_LANE:
+      if not car.opposing and self.closure and car.lane == self.closure_lane:
         to_taper = self._ds(CLOSURE_TAPER_S, car.s)
-        if 0 < to_taper < 350.0 and self._try_lane_change(car, CLOSURE_LANE - 1, ego, scale=max(0.25, to_taper / 350.0)):
+        if 0 < to_taper < 350.0 and self._try_lane_change(car, self.closure_lane - 1, ego, scale=max(0.25, to_taper / 350.0)):
           self.stats["merges"] += 1
           continue
 

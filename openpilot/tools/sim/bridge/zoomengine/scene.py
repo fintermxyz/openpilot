@@ -22,9 +22,25 @@ def deg(psi: float) -> float:
   return round(math.degrees(psi), 3)
 
 
-def car_commands(cid: str, kind: str, color, x: float, z: float, psi: float, sensor_hidden: bool = False) -> list[dict]:
+def car_rotation(psi: float, pitch: float = 0.0) -> list[float]:
+  """Euler XYZ degrees (engine order Rx*Ry*Rz) of a car heading psi with its nose pitched up by `pitch` radians"""
+  if pitch == 0.0:
+    return [0, deg(psi), 0]
+  cy, sy = math.cos(psi), math.sin(psi)
+  cp, sp = math.cos(-pitch), math.sin(-pitch)
+  R = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]]) @ np.array([[1, 0, 0], [0, cp, -sp], [0, sp, cp]])
+  a = math.atan2(-R[1, 2], R[2, 2])
+  b = math.asin(max(-1.0, min(1.0, R[0, 2])))
+  c = math.atan2(-R[0, 1], R[0, 0])
+  return [round(math.degrees(a), 3), round(math.degrees(b), 3), round(math.degrees(c), 3)]
+
+
+def car_commands(cid: str, kind: str, color, x: float, z: float, psi: float, sensor_hidden: bool = False,
+                 y0: float | None = None, rotation: list[float] | None = None) -> list[dict]:
+  """a car whose body center is at (x, y0, z), y0 defaults to the body height above flat ground at y=0"""
   hw, hh, hl, y, (cw, ch, cl, cy, cz), wr = KINDS[kind]
-  cmds = [{"action": "create", "type": "cube", "id": cid, "position": [x, y, z], "rotation": [0, deg(psi), 0],
+  cmds = [{"action": "create", "type": "cube", "id": cid, "position": [x, y if y0 is None else y0, z],
+           "rotation": rotation or [0, deg(psi), 0],
            "scale": [hw, hh, hl], "color": color, "metallic": 0.6, "roughness": 0.3, "sensor_hidden": sensor_hidden}]
 
   def child(name, typ, pos, scale, col, **kw):

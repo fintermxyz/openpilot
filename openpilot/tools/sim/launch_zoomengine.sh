@@ -2,6 +2,7 @@
 # openpilot driving a car in ZoomEngine: starts the engine's traffic scene, openpilot, and the bridge.
 #   ZOOMENGINE_DIR  ZoomEngine checkout with the self-driving work, i.e. main (default ~/Documents/zoom/ZoomEngine-main)
 #   TRAFFIC         light | heavy | chaos (default heavy)
+#   MAP             level.json of a BeamNG level converted with ZoomEngine tools/beamng_import.py (default: highway loop)
 set -e
 
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null && pwd )"
@@ -28,4 +29,4 @@ PIDS+=($!)
 echo "openpilot log: /tmp/openpilot_zoomengine.log"
 
 # the bridge reads keyboard input from this terminal
-"$DIR/run_bridge.py" --sim zoomengine --dual_camera --traffic "${TRAFFIC:-heavy}"
+"$DIR/run_bridge.py" --sim zoomengine --dual_camera --traffic "${TRAFFIC:-heavy}" ${MAP:+--map "$MAP"}
