@@ -38,10 +38,11 @@ class Track:
               float(sum(length for length, _ in segs)))
 
   @classmethod
-  def from_points(cls, pts, step: float = 1.0) -> "Track":
-    """Closed track through an ordered loop of [x, y, z] points (y up), resampled every `step` meters"""
+  def from_points(cls, pts, step: float = 1.0, closed: bool = True) -> "Track":
+    """Track through ordered [x, y, z] points (y up), resampled every `step` meters. closed: a loop (the last point joins the
+    first); otherwise an open route, arc lengths clamp to its ends."""
     pts = np.asarray(pts, dtype=float)[:, :3]
-    if np.linalg.norm(pts[0] - pts[-1]) > 1e-6:
+    if closed and np.linalg.norm(pts[0] - pts[-1]) > 1e-6:
       pts = np.vstack([pts, pts[:1]])
     seg = np.linalg.norm(np.diff(pts[:, [0, 2]], axis=0), axis=1)
     keep = np.concatenate([[True], seg > 1e-3])
@@ -55,20 +56,24 @@ class Track:
     dx, dz = np.gradient(x), np.gradient(z)
     psi = np.unwrap(np.arctan2(dx, dz))
     k = np.gradient(psi) / (length / n)
-    k = np.convolve(np.pad(k, 10, mode="wrap"), np.ones(21) / 21, mode="valid")
+    k = np.convolve(np.pad(k, 10, mode="wrap" if closed else "edge"), np.ones(21) / 21, mode="valid")
     t = cls.__new__(cls)
-    t._set(x, z, y, psi, k, length / n, length)
+    t._set(x, z, y, psi, k, length / n, length, closed)
     return t
 
-  def _set(self, x, z, y, psi, k, ds, length):
+  def _set(self, x, z, y, psi, k, ds, length, closed=True):
     self.x, self.z, self.y, self.psi, self.k = x, z, y, psi, k
     self.ds = ds
     self.length = length
-    self.n = len(self.x) - 1  # last sample == first sample (closed loop)
+    self.closed = closed
+    self.n = len(self.x) - 1  # closed: last sample == first sample
     self.grade = np.gradient(y) / ds
 
+  def _wrap(self, s):
+    return s % self.length if self.closed else np.clip(s, 0.0, self.length)
+
   def _idx(self, s: float) -> tuple[int, float]:
-    f = (s % self.length) / self.length * self.n
+    f = self._wrap(s) / self.length * self.n
     i = min(int(f), self.n - 1)
     return i, f - i
 
@@ -105,8 +110,8 @@ class Track:
 
   def project(self, x: float, z: float, s_guess: float, window: float = 60.0) -> tuple[float, float]:
     """(s, d) of a world point near s_guess"""
-    s = np.arange(s_guess - window, s_guess + window, self.ds)
-    idx = np.minimum(((s % self.length) / self.length * self.n).astype(int), self.n - 1)
+    s = self._wrap(np.arange(s_guess - window, s_guess + window, self.ds))
+    idx = np.minimum((s / self.length * self.n).astype(int), self.n - 1)
     dist2 = (self.x[idx] - x) ** 2 + (self.z[idx] - z) ** 2
     j = int(np.argmin(dist2))
     i = idx[j]
@@ -114,7 +119,7 @@ class Track:
     fx, fz = math.sin(psi), math.cos(psi)
     rx, rz = right_of(psi)
     dx, dz = x - self.x[i], z - self.z[i]
-    return float((s[j] + dx * fx + dz * fz) % self.length), float(dx * rx + dz * rz)
+    return float(self._wrap(s[j] + dx * fx + dz * fz)), float(dx * rx + dz * rz)
 
 
 def catmull_rom(nodes, step: float = 2.0) -> np.ndarray:

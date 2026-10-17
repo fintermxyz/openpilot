@@ -14,14 +14,20 @@ if TYPE_CHECKING:
 class SimulatedSensors:
   """Simulates the C3 sensors (acc, gyro, gps, peripherals, dm state, cameras) to OpenPilot"""
 
+  # messages per update() call (100 Hz). Several openpilots on one machine lower these: locationd's load scales with them
+  IMU_REPEAT = 5
+  GPS_REPEAT = 10
+  GPS_EVERY = 1  # send GPS on every n-th update
+
   def __init__(self, dual_camera=False):
     self.pm = messaging.PubMaster(['accelerometer', 'gyroscope', 'gpsLocationExternal', 'driverStateV2', 'driverMonitoringState', 'peripheralState'])
     self.camerad = Camerad(dual_camera=dual_camera)
     self.last_perp_update = 0
     self.last_dmon_update = 0
+    self.gps_count = 0
 
   def send_imu_message(self, simulator_state: 'SimulatorState'):
-    for _ in range(5):
+    for _ in range(self.IMU_REPEAT):
       dat = messaging.new_message('accelerometer', valid=True)
       dat.accelerometer.timestamp = dat.logMonoTime  # TODO: use the IMU timestamp
       dat.accelerometer.init('acceleration')
@@ -45,7 +51,10 @@ class SimulatedSensors:
       simulator_state.velocity.z,
     ]
 
-    for _ in range(10):
+    self.gps_count += 1
+    if self.gps_count % self.GPS_EVERY:
+      return
+    for _ in range(self.GPS_REPEAT):
       dat = messaging.new_message('gpsLocationExternal', valid=True)
       dat.gpsLocationExternal = {
         "unixTimestampMillis": int(time.time() * 1000),  # noqa: TID251

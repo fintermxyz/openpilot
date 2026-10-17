@@ -48,6 +48,15 @@ def _trigger(v: float) -> float:
 
 
 class ZoomEngineWorld(World):
+  # engine object / sensor ids of this car; subclasses running several cars in one engine make them unique
+  EGO_ID = "ego"
+  CAM_IDS = ("road", "wide")
+  SHM_PATHS = (SHM_ROAD, SHM_WIDE)
+  OVERLAY_PREFIX = ""
+  CAM_FORWARD_M = CAM_FORWARD
+  START_S = EGO_START_S
+  START_SPEED = EGO_START_SPEED
+
   def __init__(self, status_q, dual_camera: bool, port: int = 9090, seed: int = 0, traffic: str = "heavy", chase_camera: bool = True,
                map_path: str | None = None):
     super().__init__(dual_camera)
@@ -62,33 +71,18 @@ class ZoomEngineWorld(World):
     self.VM = VehicleModel(CarInterface.get_non_essential_params(CAR_FINGERPRINT))
     self.lock = threading.Lock()
     self.rng = np.random.default_rng(seed)
-    self.map = BeamngMap(map_path) if map_path else None
-    self.opp_traffic = None
-    if self.map is not None:
-      # BeamNG level: drive its Autobahn in the right lane, the other carriageway gets its own traffic
-      self.track = self.map.track
-      lanes = self.map.lane_offsets
-      self.ego_start_d = lanes[-1]
-      self.traffic = Traffic(self.track, self.rng, EGO_START_S, traffic, lanes=lanes, n_opposing=0, ego_lane=len(lanes) - 1)
-      if self.map.opposing_track is not None:
-        self.opp_traffic = Traffic(self.map.opposing_track, self.rng, 0.0, traffic, lanes=lanes, closure=False,
-                                   n_same=PRESETS[traffic].n_opposing, n_opposing=0, prefix="opp", ego_lane=None)
-    else:
-      self.track = Track()
-      self.ego_start_d = 0.0
-      self.traffic = Traffic(self.track, self.rng, EGO_START_S, traffic)
-    self.suburb_rng = np.random.default_rng(seed + 1)  # own stream: the highway layout and traffic stay the same
+    self._setup_world(map_path, traffic, seed)
     self._reset_ego()
     self._build_scene()
 
     # the engine converts to NV12 on the GPU, straight into VisionIPC's layout: no per-frame RGB->YUV here
     nv12 = get_nv12_info(W, H)
     self.road_yuv = np.zeros(nv12[3], dtype=np.uint8)
-    self.road_reader = SensorReader(SHM_ROAD, W, H, nv12_size=nv12[3])
+    self.road_reader = SensorReader(self.SHM_PATHS[0], W, H, nv12_size=nv12[3])
     self.wide_reader = None
     if dual_camera:
       self.wide_road_yuv = np.zeros(nv12[3], dtype=np.uint8)
-      self.wide_reader = SensorReader(SHM_WIDE, W, H, nv12_size=nv12[3])
+      self.wide_reader = SensorReader(self.SHM_PATHS[1], W, H, nv12_size=nv12[3])
 
     self.sm = messaging.SubMaster(['modelV2', 'selfdriveState', 'carControl', 'carState', 'radarState', 'onroadEvents'])
     self.cam_pos = None
@@ -113,7 +107,31 @@ class ZoomEngineWorld(World):
     self.engine_thread.start()
     self.status_q.put(QueueMessage(QueueMessageType.START_STATUS, "started"))
 
+  @property
+  def lanes(self) -> tuple:
+    """lane centre offsets the simulated driver can hold"""
+    return self.traffic.lanes
+
   # ---- scene ----
+  def _setup_world(self, map_path: str | None, traffic: str, seed: int) -> None:
+    """track, ego start lane and NPC traffic"""
+    self.map = BeamngMap(map_path) if map_path else None
+    self.opp_traffic = None
+    if self.map is not None:
+      # BeamNG level: drive its Autobahn in the right lane, the other carriageway gets its own traffic
+      self.track = self.map.track
+      lanes = self.map.lane_offsets
+      self.ego_start_d = lanes[-1]
+      self.traffic = Traffic(self.track, self.rng, EGO_START_S, traffic, lanes=lanes, n_opposing=0, ego_lane=len(lanes) - 1)
+      if self.map.opposing_track is not None:
+        self.opp_traffic = Traffic(self.map.opposing_track, self.rng, 0.0, traffic, lanes=lanes, closure=False,
+                                   n_same=PRESETS[traffic].n_opposing, n_opposing=0, prefix="opp", ego_lane=None)
+    else:
+      self.track = Track()
+      self.ego_start_d = 0.0
+      self.traffic = Traffic(self.track, self.rng, EGO_START_S, traffic)
+    self.suburb_rng = np.random.default_rng(seed + 1)  # own stream: the highway layout and traffic stay the same
+
   def _build_scene(self):
     api = self.api
     api.send({"action": "clear"})
@@ -123,7 +141,7 @@ class ZoomEngineWorld(World):
       api.send({"action": "create", "type": "plane", "id": "ground", "width": 6000.0, "height": 6000.0, "position": [650.0, -0.04, 600.0],
                 "color": [0.62, 0.72, 0.52], "texture": "assets/textures/pasture/pasture_col.png",
                 "normal_map": "assets/textures/pasture/pasture_nrm.png", "uv_scale": [0.25, 0.25, 0.0], "roughness": 0.95, "metallic": 0.0})
-    for cam_id in ("road", "wide"):
+    for cam_id in self.CAM_IDS:
       api.send({"action": "sensor_camera_remove", "id": cam_id})
     if self.map is not None:
       scene = self.map.scene_commands()
@@ -133,17 +151,18 @@ class ZoomEngineWorld(World):
     if self.opp_traffic is not None:
       cmds += self.opp_traffic.create_commands()
     y, rot = self._ego_height_rotation(self.ego_s, self.ego_psi)
-    cmds += car_commands("ego", "sedan", [0.92, 0.93, 0.95], self.ego_x, self.ego_z, self.ego_psi, sensor_hidden=True,
+    cmds += car_commands(self.EGO_ID, "sedan", [0.92, 0.93, 0.95], self.ego_x, self.ego_z, self.ego_psi, sensor_hidden=True,
                          y0=y, rotation=rot)
     api.batch(cmds, chunk=200)
 
     pip_w = 0.32
     pip_h = pip_w * H / W * 16 / 9  # keep the camera aspect on a 16:9 window
-    cam = {"action": "sensor_camera", "attach": "ego", "offset": [0, CAM_HEIGHT - CAR_Y, CAM_FORWARD], "yaw": 0, "pitch": 0,
+    cam = {"action": "sensor_camera", "attach": self.EGO_ID, "offset": [0, CAM_HEIGHT - CAR_Y, self.CAM_FORWARD_M], "yaw": 0, "pitch": 0,
            "width": W, "height": H, "hz": 20, "format": "nv12", "nv12": list(get_nv12_info(W, H))}
-    api.send({**cam, "id": "road", "hfov": 40, "shm": SHM_ROAD, "pip": [0.67, 0.02, pip_w, pip_h], "label": "road camera (openpilot input)"})
+    api.send({**cam, "id": self.CAM_IDS[0], "hfov": 40, "shm": self.SHM_PATHS[0], "pip": [0.67, 0.02, pip_w, pip_h],
+              "label": "road camera (openpilot input)"})
     if self.dual_camera:
-      api.send({**cam, "id": "wide", "hfov": 120, "shm": SHM_WIDE, "pip": [0.67, 0.04 + pip_h, pip_w, pip_h],
+      api.send({**cam, "id": self.CAM_IDS[1], "hfov": 120, "shm": self.SHM_PATHS[1], "pip": [0.67, 0.04 + pip_h, pip_w, pip_h],
                 "label": "wide camera (openpilot input)"})
     api.send({"action": "sim_input", "enabled": True})  # the engine window's keys drive the car / engage openpilot
     name = self.map.name if self.map is not None else "highway loop"
@@ -154,24 +173,23 @@ class ZoomEngineWorld(World):
 
   def _reset_ego(self):
     with self.lock:
-      self.ego_x, self.ego_z, self.ego_psi = self.track.pose(EGO_START_S, self.ego_start_d)
-      self.ego_v = EGO_START_SPEED
+      self.ego_x, self.ego_z, self.ego_psi = self.track.pose(self.START_S, self.ego_start_d)
+      self.ego_v = self.START_SPEED
       self.ego_yaw_rate = 0.0
       self.ego_accel = 0.0
       self.steer_deg = 0.0
       self.steer_cmd = 0.0
       self.accel_cmd = 0.0
-      self.ego_s, self.ego_d = EGO_START_S, self.ego_start_d
+      self.ego_s, self.ego_d = self.START_S, self.ego_start_d
       self.op_active = False
-      self.ego_pitch = self.track.pitch(EGO_START_S)
+      self.ego_pitch = self.track.pitch(self.START_S)
       self.last_t = time.monotonic()
       self.reset_time = self.last_t
 
   # ---- vehicle ----
   def _driver_steer(self) -> float:
     """steering wheel angle [deg] a human driver would use to hold the current lane (pure pursuit)"""
-    lanes = self.traffic.lanes
-    lane_d = min(lanes, key=lambda d: abs(d - self.ego_d))
+    lane_d = min(self.lanes, key=lambda d: abs(d - self.ego_d))
     lookahead = max(12.0, 1.3 * self.ego_v)
     tx, tz, _ = self.track.pose(self.ego_s + lookahead, lane_d)
     alpha = math.atan2(tx - self.ego_x, tz - self.ego_z) - self.ego_psi
@@ -307,32 +325,7 @@ class ZoomEngineWorld(World):
       dt, last = now - last, now
       with self.lock:
         ego = (self.ego_x, self.ego_z, self.ego_psi, self.ego_v, self.ego_s, self.ego_d)
-      self.traffic.step(dt, (ego[4], ego[5], ego[3]))
-      if self.opp_traffic is not None:
-        self.opp_traffic.step(dt, None)
-
-      cmds = self.traffic.engine_commands((ego[0], ego[1]), frame)
-      if self.opp_traffic is not None:
-        cmds += self.opp_traffic.engine_commands((ego[0], ego[1]), frame)
-      y, rot = self._ego_height_rotation(ego[4], ego[2])
-      # "smooth": the engine glides between these 50 Hz samples, so the view doesn't stutter at 60-120 fps
-      cmds.append({"action": "move", "id": "ego", "position": [round(ego[0], 3), round(y, 3), round(ego[1], 3)], "smooth": True})
-      cmds.append({"action": "rotate", "id": "ego", "rotation": rot, "smooth": True})
-      if self.chase_camera:
-        cmds.append(self._chase_camera(ego, dt))
-      if frame % 2 == 0:
-        self.sm.update(0)
-        self._track_engagement(ego)
-        cmds += self._overlay_commands()
-      if frame % 10 == 0:
-        cmds += self._hud_commands(ego)
-      if frame % ENGINE_HZ == 0:
-        pos = f"s {ego[4]:7.1f} m  lane offset {ego[5]:+6.2f} m  v {ego[3]:5.2f} m/s"
-        ctl = f"steer {self.steer_deg:+6.2f} (cmd {self.steer_cmd:+6.2f}) deg  accel cmd {self.accel_cmd:+5.2f}"
-        lead = self.sm['radarState'].leadOne
-        lead_str = f"{lead.dRel:5.1f} m" if lead.present else "--"
-        status = f"lead {lead_str}  collisions {self.collisions}  disengagements {self.disengagements}  {self.traffic.stats}"
-        print(f"[zoomengine] {pos}  {ctl}  {status}", flush=True)
+      cmds = self._engine_step(ego, dt, frame)
       try:
         self.api.batch(cmds)
         self._poll_input()
@@ -342,6 +335,36 @@ class ZoomEngineWorld(World):
         return
       frame += 1
       time.sleep(max(0.0, period - (time.monotonic() - now)))
+
+  def _engine_step(self, ego, dt: float, frame: int) -> list[dict]:
+    """one engine sync tick: traffic, ego pose, chase camera, overlays, HUD"""
+    self.traffic.step(dt, (ego[4], ego[5], ego[3]))
+    if self.opp_traffic is not None:
+      self.opp_traffic.step(dt, None)
+
+    cmds = self.traffic.engine_commands((ego[0], ego[1]), frame)
+    if self.opp_traffic is not None:
+      cmds += self.opp_traffic.engine_commands((ego[0], ego[1]), frame)
+    y, rot = self._ego_height_rotation(ego[4], ego[2])
+    # "smooth": the engine glides between these 50 Hz samples, so the view doesn't stutter at 60-120 fps
+    cmds.append({"action": "move", "id": self.EGO_ID, "position": [round(ego[0], 3), round(y, 3), round(ego[1], 3)], "smooth": True})
+    cmds.append({"action": "rotate", "id": self.EGO_ID, "rotation": rot, "smooth": True})
+    if self.chase_camera:
+      cmds.append(self._chase_camera(ego, dt))
+    if frame % 2 == 0:
+      self.sm.update(0)
+      self._track_engagement(ego)
+      cmds += self._overlay_commands()
+    if frame % 10 == 0:
+      cmds += self._hud_commands(ego)
+    if frame % ENGINE_HZ == 0:
+      pos = f"s {ego[4]:7.1f} m  lane offset {ego[5]:+6.2f} m  v {ego[3]:5.2f} m/s"
+      ctl = f"steer {self.steer_deg:+6.2f} (cmd {self.steer_cmd:+6.2f}) deg  accel cmd {self.accel_cmd:+5.2f}"
+      lead = self.sm['radarState'].leadOne
+      lead_str = f"{lead.dRel:5.1f} m" if lead.present else "--"
+      status = f"lead {lead_str}  collisions {self.collisions}  disengagements {self.disengagements}  {self.traffic.stats}"
+      print(f"[zoomengine] {pos}  {ctl}  {status}", flush=True)
+    return cmds
 
   def _chase_camera(self, ego, dt):
     x, z, psi = ego[0], ego[1], ego[2]
@@ -353,14 +376,13 @@ class ZoomEngineWorld(World):
     return {"action": "camera", "position": [round(float(c), 3) for c in self.cam_pos], "target": [x + 10.0 * fx, h + 1.2, z + 10.0 * fz],
             "smooth": True}
 
-  @staticmethod
-  def _to_ego(x, y, max_x=None):
+  def _to_ego(self, x, y, max_x=None):
     """device frame (x fwd, y right) -> ego object local frame (+x left, +y up, +z fwd) at road level"""
     pts = []
     for xi, yi in zip(x, y, strict=True):
       if max_x is not None and xi > max_x:
         break
-      pts.append([round(-yi, 3), round(0.03 - CAR_Y, 3), round(xi + CAM_FORWARD, 3)])
+      pts.append([round(-yi, 3), round(0.03 - CAR_Y, 3), round(xi + self.CAM_FORWARD_M, 3)])
     return pts
 
   def _overlay_commands(self) -> list[dict]:
@@ -371,23 +393,23 @@ class ZoomEngineWorld(World):
     cmds = []
     if len(md.position.x):
       color = [0.1, 0.9, 0.35, 0.55] if engaged else [0.9, 0.9, 0.9, 0.45]
-      cmds.append({"action": "overlay_path", "id": "plan", "attach": "ego", "points": self._to_ego(md.position.x, md.position.y, 120.0),
-                   "color": color, "width": 1.0})
+      cmds.append({"action": "overlay_path", "id": f"{self.OVERLAY_PREFIX}plan", "attach": self.EGO_ID,
+                   "points": self._to_ego(md.position.x, md.position.y, 120.0), "color": color, "width": 1.0})
     for i, (line, prob) in enumerate(zip(md.laneLines, md.laneLineProbs, strict=False)):
       if len(line.x):
-        cmds.append({"action": "overlay_path", "id": f"lane{i}", "attach": "ego", "points": self._to_ego(line.x, line.y, 100.0),
+        cmds.append({"action": "overlay_path", "id": f"{self.OVERLAY_PREFIX}lane{i}", "attach": self.EGO_ID, "points": self._to_ego(line.x, line.y, 100.0),
                      "color": [1.0, 1.0, 1.0, round(0.15 + 0.7 * float(prob), 3)], "width": 0.12})
     for i, edge in enumerate(md.roadEdges):
       if len(edge.x):
-        cmds.append({"action": "overlay_path", "id": f"edge{i}", "attach": "ego", "points": self._to_ego(edge.x, edge.y, 100.0),
+        cmds.append({"action": "overlay_path", "id": f"{self.OVERLAY_PREFIX}edge{i}", "attach": self.EGO_ID, "points": self._to_ego(edge.x, edge.y, 100.0),
                      "color": [1.0, 0.15, 0.15, 0.6], "width": 0.12})
     lead = self.sm['radarState'].leadOne
     if lead.present:
       d, y = lead.dRel, lead.yRel
-      cmds.append({"action": "overlay_path", "id": "lead", "attach": "ego",
+      cmds.append({"action": "overlay_path", "id": f"{self.OVERLAY_PREFIX}lead", "attach": self.EGO_ID,
                    "points": self._to_ego([d - 1.2, d], [-y, -y]), "color": [1.0, 0.25, 0.1, 0.8], "width": 2.0})
     else:
-      cmds.append({"action": "overlay_path_remove", "id": "lead"})
+      cmds.append({"action": "overlay_path_remove", "id": f"{self.OVERLAY_PREFIX}lead"})
     return cmds
 
   def _hud_commands(self, ego) -> list[dict]:
