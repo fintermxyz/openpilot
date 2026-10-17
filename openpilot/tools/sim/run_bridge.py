@@ -42,6 +42,9 @@ if __name__ == "__main__":
     from openpilot.tools.sim.lib.manual_ctrl import wheel_poll_thread
 
     wheel_poll_thread(queue)
+  elif args.sim == "zoomengine":
+    # driving keys come from the ZoomEngine window (sim_input), not this terminal; Q there quits
+    simulator_process.join()
   else:
     # start input poll for keyboard
     from openpilot.tools.sim.lib.keyboard_ctrl import keyboard_poll_thread

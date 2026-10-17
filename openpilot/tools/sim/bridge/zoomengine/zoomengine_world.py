@@ -7,8 +7,9 @@ import numpy as np
 from opendbc.car.honda.interface import CarInterface
 from opendbc.car.vehicle_model import VehicleModel
 from openpilot.cereal import messaging
-from openpilot.tools.sim.bridge.common import QueueMessage, QueueMessageType
-from openpilot.tools.sim.bridge.zoomengine.scene import CAR_Y, car_commands, deg, props_commands, road_commands
+from openpilot.tools.sim.bridge.common import ManualInput, QueueMessage, QueueMessageType, control_cmd_gen
+from openpilot.tools.sim.bridge.zoomengine.scene import CAR_Y, EDGE, car_commands, deg, props_commands, road_commands
+from openpilot.tools.sim.bridge.zoomengine.suburb import keep_clear, suburb_commands
 from openpilot.tools.sim.bridge.zoomengine.track import Track
 from openpilot.tools.sim.bridge.zoomengine.traffic import Traffic
 from openpilot.tools.sim.bridge.zoomengine.zoom_api import SensorReader, ZoomAPI
@@ -30,6 +31,19 @@ SHM_WIDE = "/tmp/zoom_sensor_wide.bin"
 
 ENGINE_HZ = 50
 
+# manual driving from the engine window (keys polled from the agent API, see _poll_input)
+MAX_LAT_ACCEL = 4.0      # m/s^2, full A/D lock at speed
+MAX_CURVATURE = 0.12     # 1/m, full lock when slow
+STEER_EASE = 8.0         # 1/s, steering eases toward the key target (like the drive demo)
+MANUAL_KEYS = ("w", "a", "s", "d", "up", "down", "left", "right", "space")  # pressing any while engaged disengages
+PAD_TAKEOVER = 0.25      # gamepad stick / trigger past this while engaged disengages (resting noise never does)
+TRIGGER_DEADZONE = 0.05
+TAP_ALIASES = {"select": "e", "pad_up": "+", "pad_down": "-"}  # gamepad buttons that act like keys
+
+
+def _trigger(v: float) -> float:
+  return float(np.clip((v - TRIGGER_DEADZONE) / (1.0 - TRIGGER_DEADZONE), 0.0, 1.0))
+
 
 class ZoomEngineWorld(World):
   def __init__(self, status_q, dual_camera: bool, port: int = 9090, seed: int = 0, traffic: str = "heavy", chase_camera: bool = True):
@@ -46,6 +60,7 @@ class ZoomEngineWorld(World):
     self.track = Track()
     self.lock = threading.Lock()
     self.rng = np.random.default_rng(seed)
+    self.suburb_rng = np.random.default_rng(seed + 1)  # own stream: the highway layout and traffic stay the same
     self.traffic = Traffic(self.track, self.rng, EGO_START_S, traffic)
     self._reset_ego()
     self._build_scene()
@@ -62,8 +77,16 @@ class ZoomEngineWorld(World):
     self.was_active = False
     self.disengaged_at: float | None = None
     self.user_disengaged = False
+    self.driver_took_over = False  # WASD / E cancelled openpilot: no auto re-engage until it is engaged again
     self.disengagements = 0
     self.last_disengage_reason = ""
+    # engine window keys
+    self.held: dict[str, int] = {}
+    self.pad: dict[str, float] = {}
+    self.manual_held = False
+    self.taps: dict[str, int] | None = None
+    self.manual_steer = 0.0
+    self.manual_t = time.monotonic()
     self.engine_thread = threading.Thread(target=self._engine_loop, daemon=True)
     self.engine_thread.start()
     self.status_q.put(QueueMessage(QueueMessageType.START_STATUS, "started"))
@@ -72,9 +95,15 @@ class ZoomEngineWorld(World):
   def _build_scene(self):
     api = self.api
     api.send({"action": "clear"})
+    # clear also removes the engine scene's own ground, so lay grass again (a little below the road ribbons so they never
+    # z-fight with it); it covers the loop and the suburb with kilometres to spare
+    api.send({"action": "create", "type": "plane", "id": "ground", "width": 6000.0, "height": 6000.0, "position": [650.0, -0.04, 600.0],
+              "color": [0.62, 0.72, 0.52], "texture": "assets/textures/pasture/pasture_col.png",
+              "normal_map": "assets/textures/pasture/pasture_nrm.png", "uv_scale": [0.25, 0.25, 0.0], "roughness": 0.95, "metallic": 0.0})
     for cam_id in ("road", "wide"):
       api.send({"action": "sensor_camera_remove", "id": cam_id})
-    cmds = road_commands(self.track) + props_commands(self.track, self.rng) + self.traffic.create_commands()
+    cmds = road_commands(self.track) + props_commands(self.track, self.rng, keep_clear) + self.traffic.create_commands()
+    cmds += suburb_commands(self.track, self.suburb_rng)
     x, z, psi = self.ego_x, self.ego_z, self.ego_psi
     cmds += car_commands("ego", "sedan", [0.92, 0.93, 0.95], x, z, psi, sensor_hidden=True)
     api.batch(cmds)
@@ -87,6 +116,7 @@ class ZoomEngineWorld(World):
     if self.dual_camera:
       api.send({**cam, "id": "wide", "hfov": 120, "shm": SHM_WIDE, "pip": [0.67, 0.04 + pip_h, pip_w, pip_h],
                 "label": "wide camera (openpilot input)"})
+    api.send({"action": "sim_input", "enabled": True})  # the engine window's keys drive the car / engage openpilot
     print(f"---- ZoomEngine scene built: {len(cmds)} objects, track {self.track.length:.0f} m ----")
 
   def _reset_ego(self):
@@ -121,6 +151,62 @@ class ZoomEngineWorld(World):
       self.ego_x += self.ego_v * math.sin(self.ego_psi) * dt
       self.ego_z += self.ego_v * math.cos(self.ego_psi) * dt
       self.ego_s, self.ego_d = self.track.project(self.ego_x, self.ego_z, self.ego_s)
+
+  def manual_input(self) -> ManualInput:
+    """Held keys from the engine window -> gas/brake and an eased steering wheel angle (used while disengaged)"""
+    held, pad = self.held, self.pad
+    with self.lock:
+      v, steer_deg = self.ego_v, self.steer_deg
+    now = time.monotonic()
+    dt = min(0.05, now - self.manual_t)
+    self.manual_t = now
+    gas = max(1.0 if held.get("w") or held.get("up") else 0.0, _trigger(pad.get("gas", 0.0)))
+    brake = max(1.0 if held.get("s") or held.get("down") or held.get("space") else 0.0, _trigger(pad.get("brake", 0.0)))
+    steer_in = float(bool(held.get("a") or held.get("left"))) - float(bool(held.get("d") or held.get("right")))  # +1 = left
+    steer_in = float(np.clip(steer_in - pad.get("steer", 0.0), -1.0, 1.0))  # stick right = +1: proportional steering
+    if self.was_active:
+      self.manual_steer = steer_deg  # openpilot is steering: pick up from its wheel angle when it lets go
+    else:
+      u = max(v, 1.0)
+      curvature = min(MAX_CURVATURE, MAX_LAT_ACCEL / (u * u))
+      target = steer_in * math.degrees(self.VM.get_steer_from_curvature(curvature, u, 0.0))
+      self.manual_steer += (target - self.manual_steer) * min(1.0, dt * STEER_EASE)
+    return ManualInput(gas, brake, -0.15 * steer_in, self.manual_steer)
+
+  def _poll_input(self) -> None:
+    """Engine window keys and gamepad (sim_input): WASD / left stick + R2 / L2 drive (and take over from openpilot),
+    E / select engage / disengage, +/- / d-pad change the set speed while engaged, R resets, Q quits"""
+    inp = self.api.query().get("input")
+    if not inp:
+      return
+    self.held = inp.get("held", {})
+    self.pad = inp.get("pad", {}) if inp.get("pad", {}).get("connected") else {}
+    pad_active = abs(self.pad.get("steer", 0.0)) > PAD_TAKEOVER or max(self.pad.get("gas", 0.0), self.pad.get("brake", 0.0)) > PAD_TAKEOVER
+    manual = pad_active or any(self.held.get(k) for k in MANUAL_KEYS)
+    if manual and not self.manual_held and self.was_active:
+      self._driver_cancel()  # the driver takes over
+    self.manual_held = manual
+
+    taps = inp.get("taps", {})
+    if self.taps is not None:
+      for name in ("e", "+", "-", "r", "q", *TAP_ALIASES):
+        key = TAP_ALIASES.get(name, name)
+        for _ in range(max(0, taps.get(name, 0) - self.taps.get(name, 0))):
+          if key == "e" and self.was_active:
+            self._driver_cancel()
+            continue
+          cmd = {"e": "cruise_down",  # set: engage at the current speed
+                 "+": "cruise_up" if self.was_active else None,
+                 "-": "cruise_down" if self.was_active else None,
+                 "r": "reset", "q": "quit"}[key]
+          if cmd is not None:
+            self.status_q.put(control_cmd_gen(cmd))
+    self.taps = taps
+
+  def _driver_cancel(self) -> None:
+    # the cancel button event lasts one frame, too short for _track_engagement to see reliably, so remember it here
+    self.driver_took_over = True
+    self.status_q.put(control_cmd_gen("cruise_cancel"))
 
   def read_state(self):
     pass
@@ -189,6 +275,7 @@ class ZoomEngineWorld(World):
         print(f"[zoomengine] {pos}  {ctl}  {status}", flush=True)
       try:
         self.api.batch(cmds)
+        self._poll_input()
       except OSError:
         print("ZoomEngine went away, stopping")
         self.exit_event.set()
@@ -244,7 +331,7 @@ class ZoomEngineWorld(World):
   def _hud_commands(self, ego) -> list[dict]:
     ss, cs, cc = self.sm['selfdriveState'], self.sm['carState'], self.sm['carControl']
     lead = self.sm['radarState'].leadOne
-    state = "ENGAGED" if ss.active else ("ready, press 2 to engage" if ss.engageable else "not ready")
+    state = "ENGAGED" if ss.active else ("off, you're driving (E to engage)" if ss.engageable else "not ready, you're driving")
     set_speed = f"{cs.vCruise:.0f} km/h" if ss.active else "--"
     colliding = self._colliding(ego)
     if colliding and not self.was_colliding:
@@ -253,15 +340,18 @@ class ZoomEngineWorld(World):
     self.was_colliding = colliding is not None
     lead_str = f"{lead.dRel:5.1f} m" if lead.present else "  --  "
     disengaged = f"disengagements {self.disengagements} {self.last_disengage_reason}"
+    on_highway = abs(ego[5]) < EDGE + 2.5
+    where = f"lane offset {ego[5]:+5.2f} m" if on_highway else ("in the suburb" if keep_clear(ego[4], ego[5]) else "off the highway")
     lines = [
       (f"openpilot {state}   speed {ego[3] * 3.6:5.1f} km/h   set {set_speed}", [0.2, 1.0, 0.4] if ss.active else [1.0, 1.0, 1.0]),
       (f"steer {self.steer_deg:+6.1f} deg (cmd {self.steer_cmd:+6.1f})   accel cmd {cc.actuators.accel:+5.2f} m/s^2   lead {lead_str}",
        [0.85, 0.85, 0.85]),
-      (f"lane offset {ego[5]:+5.2f} m   lap {ego[4]:6.0f} / {self.track.length:.0f} m   collisions {self.collisions} {self.collision_kinds}   {disengaged}",
-       [1.0, 0.4, 0.3] if abs(ego[5]) > 2.5 or self.collisions else [0.85, 0.85, 0.85]),
+      (f"{where}   lap {ego[4]:6.0f} / {self.track.length:.0f} m   collisions {self.collisions} {self.collision_kinds}   {disengaged}",
+       [1.0, 0.4, 0.3] if (on_highway and abs(ego[5]) > 2.5) or self.collisions else [0.85, 0.85, 0.85]),
       ("traffic {name}: {n} cars   cut-ins {cut_ins}   hard brakes {hard_brakes}   brake checks {brake_checks}   merges {merges}".format(
         name=self.traffic.preset_name, n=len(self.traffic.cars), **self.traffic.stats), [1.0, 0.75, 0.3]),
-      ("bridge keys: 1 accel/resume  2 set/decel  3 cancel  S brake  WASD manual  R reset  Q quit", [0.6, 0.6, 0.6]),
+      ("keys: WASD manual   +/- set speed   E engage/disengage   R reset   Q quit", [0.6, 0.6, 0.6]),
+      ("pad: left stick + R2/L2 manual   d-pad set speed   select engage/disengage", [0.6, 0.6, 0.6]),
     ]
     return [{"action": "hud_text", "id": f"hud{i}", "text": t, "pos": [0.015, 0.025 + 0.03 * i], "color": c, "scale": 1.0}
             for i, (t, c) in enumerate(lines)]
@@ -277,11 +367,13 @@ class ZoomEngineWorld(World):
       print(f"[zoomengine] DISENGAGED at s {ego[4]:.0f} m, v {ego[3]:.1f} m/s, events: {[str(e.name) for e in events]}", flush=True)
     elif active:
       self.disengaged_at = None
+      if not self.was_active:
+        self.driver_took_over = False  # engaged again (not the moments before our cancel lands)
     self.was_active = active
 
   def disengaged_for(self) -> float:
     """seconds since openpilot disengaged on its own, 0 while engaged or after a user disengagement"""
-    if self.disengaged_at is None or self.user_disengaged:
+    if self.disengaged_at is None or self.user_disengaged or self.driver_took_over:
       return 0.0
     return time.monotonic() - self.disengaged_at
 

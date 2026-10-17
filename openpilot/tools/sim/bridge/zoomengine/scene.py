@@ -81,13 +81,19 @@ def road_commands(track: Track) -> list[dict]:
   return cmds
 
 
-def props_commands(track: Track, rng: np.random.Generator) -> list[dict]:
+def props_commands(track: Track, rng: np.random.Generator, keep_clear=None) -> list[dict]:
+  """Roadside props; keep_clear(s, d) -> True skips a prop there (rng draws are unchanged, so the rest stays put)"""
   cmds: list[dict] = []
+  clear = keep_clear or (lambda s, d: False)
 
   # street lights along the outer shoulder
   s = 0.0
   i = 0
   while s < track.length:
+    if clear(s, EDGE + 4.0):
+      s += 60.0
+      i += 1
+      continue
     x, z, psi = track.pose(s, EDGE + 4.0)
     cmds.append({"action": "create", "type": "cylinder", "id": f"pole{i}", "position": [x, 5.0, z], "radius": 0.12,
                  "height": 10.0, "segments": 10, "color": [0.45, 0.46, 0.48], "metallic": 0.8, "roughness": 0.4})
@@ -118,9 +124,12 @@ def props_commands(track: Track, rng: np.random.Generator) -> list[dict]:
     x, z, _ = track.pose(s, d)
     h = rng.uniform(5, 11)
     green = [rng.uniform(0.08, 0.16), rng.uniform(0.22, 0.38), rng.uniform(0.06, 0.12)]
+    round_crown = rng.random() >= 0.5
+    if clear(s, d):
+      continue
     cmds.append({"action": "create", "type": "cylinder", "id": f"trunk{i}", "position": [x, h * 0.3, z], "radius": 0.25,
                  "height": h * 0.6, "segments": 8, "color": [0.3, 0.2, 0.12], "roughness": 0.95})
-    if rng.random() < 0.5:
+    if not round_crown:
       cmds.append({"action": "create", "type": "cone", "id": f"crown{i}", "position": [x, h * 0.45, z], "radius": h * 0.28,
                    "height": h * 0.85, "segments": 10, "color": green, "roughness": 0.95})
     else:
@@ -136,7 +145,10 @@ def props_commands(track: Track, rng: np.random.Generator) -> list[dict]:
     x, z, psi = track.pose(s, d)
     w, ln, h = rng.uniform(8, 25), rng.uniform(10, 35), rng.choice([rng.uniform(4, 12), rng.uniform(15, 60)])
     tone = rng.uniform(0.35, 0.8)
+    tint = rng.uniform(0.9, 1.0), rng.uniform(0.85, 1.0)
+    if clear(s, d):
+      continue
     cmds.append({"action": "create", "type": "cube", "id": f"bldg{i}", "position": [x, h / 2, z], "rotation": [0, deg(psi), 0],
-                 "scale": [w / 2, h / 2, ln / 2], "color": [tone, tone * rng.uniform(0.9, 1.0), tone * rng.uniform(0.85, 1.0)],
+                 "scale": [w / 2, h / 2, ln / 2], "color": [tone, tone * tint[0], tone * tint[1]],
                  "roughness": 0.8})
   return cmds
