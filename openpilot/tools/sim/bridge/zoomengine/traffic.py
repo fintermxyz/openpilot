@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from openpilot.tools.sim.bridge.zoomengine.scene import CAR_COLORS, KINDS, OPPOSING_D, car_commands, car_rotation, deg
-from openpilot.tools.sim.bridge.zoomengine.track import LANE_WIDTH, Track
+from openpilot.tools.sim.bridge.zoomengine.track import LANE_WIDTH, Track, right_of
 
 LANE_OFFSETS = (-LANE_WIDTH, 0.0, LANE_WIDTH)
 EGO_HALF_LENGTH = 2.3
@@ -66,6 +66,8 @@ class Car:
   cooldown: float = 0.0
   brake_until_v: float = -1.0  # hard braking event: brake until below this speed
   brake_hold: float = 0.0
+  lat_v: float = 0.0       # sideways slide after a collision (m/s, + = right of the track)
+  crashed: bool = False    # hit by ego: brakes to a stop and stays there
   lanes: tuple = LANE_OFFSETS
   opposing_d: float = OPPOSING_D
 
@@ -101,7 +103,9 @@ class Traffic:
     self.cars: list[Car] = []
     self.t = 0.0
     self.next_brake_check = self.preset.brake_check_period or FAR
-    self.stats = {"cut_ins": 0, "hard_brakes": 0, "brake_checks": 0, "merges": 0}
+    self.stats = {"cut_ins": 0, "hard_brakes": 0, "brake_checks": 0, "merges": 0, "crashed": 0}
+    self.prefix = prefix
+    self.by_id: dict[str, Car] = {}
     kinds = ["sedan"] * 6 + ["suv"] * 3 + ["truck"]
     p = self.preset
     n_same = p.n_same if n_same is None else n_same
@@ -143,6 +147,7 @@ class Traffic:
               lanes=self.lanes, opposing_d=self.opposing_d)
     car.d = car.d_from = car.lane_d(lane)
     self.cars.append(car)
+    self.by_id[cid] = car
 
   def _ds(self, a: float, b: float) -> float:
     """signed shortest arc length from b to a"""
@@ -218,6 +223,25 @@ class Traffic:
       cmds.append({"action": "move", "id": car.cid, "position": [round(x, 3), round(y, 3), round(z, 3)], "smooth": True})
       cmds.append({"action": "rotate", "id": car.cid, "rotation": rot, "smooth": True})
     return cmds
+
+  def apply_hit(self, cid: str, dv: list[float]) -> bool:
+    """velocity change from a collision with ego (world x, y, z, from the engine's physics car): along the road it changes
+    the car's speed, across it starts a sideways slide. A real hit (> 1 m/s) wrecks the car: it brakes to a stop and stays
+    there. False if cid isn't one of this traffic's cars"""
+    car = self.by_id.get(cid)
+    if car is None:
+      return False
+    _, _, psi = self.track.pose(car.s, car.d)
+    rx, rz = right_of(psi)
+    along = dv[0] * math.sin(psi) + dv[2] * math.cos(psi)
+    across = dv[0] * rx + dv[2] * rz
+    car.v = max(0.0, car.v + (-along if car.opposing else along))
+    car.lat_v += across
+    if math.hypot(along, across) > 1.0 and not car.crashed:
+      car.crashed = True
+      car.lc_t, car.brake_until_v = -1.0, -1.0
+      self.stats["crashed"] += 1
+    return True
 
   # ---- simulation ----
   def _snapshot(self) -> None:
@@ -305,9 +329,18 @@ class Traffic:
         car.brake_until_v = car.v * float(self.rng.uniform(0.3, 0.7))
         self.stats["hard_brakes"] += 1
 
+      if car.crashed:
+        a = -6.0   # wrecked: brakes to a stop and stays there
       car.v = max(0.0, car.v + max(-9.0, a) * dt)
       ds = car.v * dt / (1.0 + self.track.curvature(car.s) * car.d)
       car.s = (car.s + (-ds if car.opposing else ds)) % self.track.length
+      if car.lat_v:   # sideways slide from a collision, scrubbed off by the tyres
+        car.d += car.lat_v * dt
+        car.lat_v *= math.exp(-dt * 1.5)
+        if abs(car.lat_v) < 0.05:
+          car.lat_v = 0.0
+      if car.crashed:
+        continue
 
       car.cooldown -= dt
       if car.lc_t >= 0:

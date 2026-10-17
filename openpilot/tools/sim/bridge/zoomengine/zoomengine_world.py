@@ -1,4 +1,5 @@
 import math
+import os
 import threading
 import time
 
@@ -32,6 +33,15 @@ SHM_ROAD = "/tmp/zoom_sensor_road.bin"
 SHM_WIDE = "/tmp/zoom_sensor_wide.bin"
 
 ENGINE_HZ = 50
+
+# the ego car is a physics vehicle in the engine (src/physics/Vehicle.h): suspension, tyres, engine, CVT, brakes
+VEHICLE_PARAMS = "assets/vehicles/honda_civic_2022.json"   # relative to the engine's working directory
+VEHICLE_MASS = 1400.0
+COLLIDER_MATERIALS = ["Road_", "Terrain", "Concrete", "Rail_"]   # BeamNG mesh materials the car can touch
+# longitudinal "ECU": openpilot asks for an acceleration, the car needs pedals
+LONG_KP, LONG_KI = 0.25, 0.4
+WHEEL_POWER_W = 103e3   # ~ max power at the wheels, for the throttle feedforward
+KEY_BRAKE = 0.5         # S / down: firm braking; Space: full
 
 # manual driving from the engine window (keys polled from the agent API, see _poll_input)
 MAX_LAT_ACCEL = 4.0      # m/s^2, full A/D lock at speed
@@ -91,10 +101,10 @@ class ZoomEngineWorld(World):
       self.wide_reader = SensorReader(SHM_WIDE, W, H, nv12_size=nv12[3])
 
     self.sm = messaging.SubMaster(['modelV2', 'selfdriveState', 'carControl', 'carState', 'radarState', 'onroadEvents'])
-    self.cam_pos = None
     self.collisions = 0
     self.was_colliding = False
     self.collision_kinds = {"ego": 0, "npc": 0, "cut-in": 0}
+    self.hits_seen: dict[str, list[float]] = {}   # the engine's cumulative per-car velocity changes, last read
     # disengagement tracking, the bridge re-engages unless the disengagement was user initiated
     self.was_active = False
     self.disengaged_at: float | None = None
@@ -123,6 +133,17 @@ class ZoomEngineWorld(World):
       api.send({"action": "create", "type": "plane", "id": "ground", "width": 6000.0, "height": 6000.0, "position": [650.0, -0.04, 600.0],
                 "color": [0.62, 0.72, 0.52], "texture": "assets/textures/pasture/pasture_col.png",
                 "normal_map": "assets/textures/pasture/pasture_nrm.png", "uv_scale": [0.25, 0.25, 0.0], "roughness": 0.95, "metallic": 0.0})
+    # what the physics car drives on: the flat loop gets one ground quad, BeamNG levels their road / terrain / barrier meshes
+    if self.map is None:
+      L, cx, cz = 3000.0, 650.0, 600.0
+      api.send({"action": "mesh_collider", "id": "ground_collider", "material": "default", "indices": [0, 2, 1, 0, 3, 2],
+                "verts": [cx - L, 0, cz - L, cx + L, 0, cz - L, cx + L, 0, cz + L, cx - L, 0, cz + L]})
+    else:
+      for i, st in enumerate(self.map.level["statics"]):
+        if not st.get("dynamic"):
+          api.send({"action": "mesh_collider", "id": f"collider{i}", "gltf": os.path.join(self.map.dir, st["path"]),
+                    "materials": COLLIDER_MATERIALS, "position": st["position"], "rotation": st["rotation"], "scale": st["scale"],
+                    "material": "default"})
     for cam_id in ("road", "wide"):
       api.send({"action": "sensor_camera_remove", "id": cam_id})
     if self.map is not None:
@@ -136,6 +157,7 @@ class ZoomEngineWorld(World):
     cmds += car_commands("ego", "sedan", [0.92, 0.93, 0.95], self.ego_x, self.ego_z, self.ego_psi, sensor_hidden=True,
                          y0=y, rotation=rot)
     api.batch(cmds, chunk=200)
+    api.send(self._vehicle_spawn_command("vehicle"))
 
     pip_w = 0.32
     pip_h = pip_w * H / W * 16 / 9  # keep the camera aspect on a 16:9 window
@@ -163,6 +185,11 @@ class ZoomEngineWorld(World):
       self.accel_cmd = 0.0
       self.ego_s, self.ego_d = EGO_START_S, self.ego_start_d
       self.op_active = False
+      self.throttle_cmd = self.brake_cmd = 0.0
+      self.long_i = 0.0
+      self.ego_y = self.track.height(EGO_START_S)
+      self.ego_specific_force = [0.0, GRAVITY, 0.0]
+      self.veh: dict = {}
       self.ego_pitch = self.track.pitch(EGO_START_S)
       self.last_t = time.monotonic()
       self.reset_time = self.last_t
@@ -189,20 +216,28 @@ class ZoomEngineWorld(World):
       if not self.op_active and not self.driver_took_over and not self.manual_held and abs(steer_angle) < 1e-6:
         steer_angle = self._driver_steer()
       self.steer_cmd = float(steer_angle)
-      self.accel_cmd = 1.6 * float(throttle_out) - 4.0 * float(brake_out)
+      if self.op_active:
+        # openpilot drives: turn its acceleration request into pedals like the car's powertrain ECU
+        throttle_out, brake_out = self._pedals_for_accel(float(self.sm['carControl'].actuators.accel), dt)
+      else:
+        self.long_i = 0.0
+      self.throttle_cmd, self.brake_cmd = float(throttle_out), float(brake_out)
+      self.accel_cmd = self.ego_accel
+    # the engine simulates the car: commands go out and its state comes back in _engine_loop
 
-      self.steer_deg += float(np.clip(self.steer_cmd - self.steer_deg, -STEER_RATE * dt, STEER_RATE * dt))
-      v = self.ego_v
-      drag = 0.02 + 0.0004 * v * v if v > 0.1 else 0.0
-      self.ego_pitch = self.track.pitch(self.ego_s)
-      grade = GRAVITY * math.sin(self.ego_pitch) if v > 0.1 or self.accel_cmd > 0 else 0.0  # parked cars don't roll back
-      self.ego_v = max(0.0, v + (self.accel_cmd - drag - grade) * dt)
-      self.ego_accel = (self.ego_v - v) / dt if dt > 0 else 0.0
-      self.ego_yaw_rate = self.ego_v * self.VM.calc_curvature(math.radians(self.steer_deg), self.ego_v, 0.0)
-      self.ego_psi += self.ego_yaw_rate * dt
-      self.ego_x += self.ego_v * math.sin(self.ego_psi) * dt
-      self.ego_z += self.ego_v * math.cos(self.ego_psi) * dt
-      self.ego_s, self.ego_d = self.track.project(self.ego_x, self.ego_z, self.ego_s)
+  def _pedals_for_accel(self, a_req: float, dt: float) -> tuple[float, float]:
+    """throttle / brake for an acceleration request: feedforward from drag, rolling and grade, PI on the measured accel"""
+    v = max(self.ego_v, 0.0)
+    resist = (0.5 * 1.225 * 0.28 * 2.15 * v * v) / VEHICLE_MASS + 0.010 * GRAVITY + GRAVITY * math.sin(self.ego_pitch)
+    coast = -(resist + 0.3)   # what lifting off gives (engine braking ~0.3 m/s^2)
+    if a_req < coast - 0.05:
+      self.long_i = 0.0
+      return 0.0, float(np.clip((coast - a_req) / 9.0, 0.0, 1.0))
+    need = max(0.0, (a_req + resist) * VEHICLE_MASS)
+    ff = math.sqrt(min(1.0, need / min(8000.0, WHEEL_POWER_W / max(v, 1.0))))   # part throttle runs the CVT at low rpm
+    err = a_req - self.ego_accel
+    self.long_i = float(np.clip(self.long_i + LONG_KI * err * dt, -0.3, 0.3))
+    return float(np.clip(ff + LONG_KP * err + self.long_i, 0.0, 1.0)), 0.0
 
   def manual_input(self) -> ManualInput:
     """Held keys from the engine window -> gas/brake and an eased steering wheel angle (used while disengaged)"""
@@ -213,7 +248,7 @@ class ZoomEngineWorld(World):
     dt = min(0.05, now - self.manual_t)
     self.manual_t = now
     gas = max(1.0 if held.get("w") or held.get("up") else 0.0, _trigger(pad.get("gas", 0.0)))
-    brake = max(1.0 if held.get("s") or held.get("down") or held.get("space") else 0.0, _trigger(pad.get("brake", 0.0)))
+    brake = max(1.0 if held.get("space") else KEY_BRAKE if held.get("s") or held.get("down") else 0.0, _trigger(pad.get("brake", 0.0)))
     steer_in = float(bool(held.get("a") or held.get("left"))) - float(bool(held.get("d") or held.get("right")))  # +1 = left
     steer_in = float(np.clip(steer_in - pad.get("steer", 0.0), -1.0, 1.0))  # stick right = +1: proportional steering
     if self.was_active:
@@ -225,10 +260,50 @@ class ZoomEngineWorld(World):
       self.manual_steer += (target - self.manual_steer) * min(1.0, dt * STEER_EASE)
     return ManualInput(gas, brake, -0.15 * steer_in, self.manual_steer)
 
-  def _poll_input(self) -> None:
+  def _read_vehicle(self, q: dict) -> None:
+    """ego state from the engine's physics car"""
+    v = q.get("vehicles", {}).get("ego")
+    if not v:
+      return
+    with self.lock:
+      self.veh = v
+      self.ego_x, self.ego_y, self.ego_z = v["position"]
+      self.ego_psi, self.ego_pitch, self.ego_v = v["heading"], v["pitch"], v["speed"]
+      self.ego_yaw_rate, self.steer_deg = v["yaw_rate"], v["steer_deg"]
+      self.ego_specific_force = v["accel"]
+      a = v["accel"][2] - GRAVITY * math.sin(self.ego_pitch)   # kinematic, along the heading
+      self.ego_accel += (a - self.ego_accel) * 0.3              # light filter: frame-to-frame derivative
+      self.ego_s, self.ego_d = self.track.project(self.ego_x, self.ego_z, self.ego_s)
+    self._apply_hits(v.get("hits", {}))
+
+  def _apply_hits(self, hits: dict) -> None:
+    """car-to-car: the engine's physics car hit traffic cars; give them the velocity change (they may be wrecked)"""
+    for cid, h in hits.items():
+      prev = self.hits_seen.get(cid, [0.0, 0.0, 0.0])
+      dv = [h["dv"][i] - prev[i] for i in range(3)]
+      self.hits_seen[cid] = h["dv"]
+      if max(abs(x) for x in dv) < 1e-3:
+        continue
+      for tr in (self.traffic, self.opp_traffic):
+        if tr is not None and tr.apply_hit(cid, dv):
+          print(f"[zoomengine] HIT {cid}: closing {h['speed']:.1f} m/s, its dv {math.hypot(dv[0], dv[2]):.1f} m/s", flush=True)
+          break
+
+  def _vehicle_spawn_command(self, action: str) -> dict:
+    x, z, psi = self.track.pose(EGO_START_S, self.ego_start_d)
+    cmd = {"action": action, "id": "ego", "params": VEHICLE_PARAMS, "attach": "ego", "position": [x, self.track.height(EGO_START_S), z],
+           "heading": math.degrees(psi), "speed": EGO_START_SPEED}
+    if self.chase_camera:
+      # the engine's own chase camera follows the car in the same frame as its pose (a 50 Hz API camera lags it: jitter)
+      cmd["chase"] = {"back": 11.0, "up": 4.2, "ahead": 10.0, "rate": 4.0}
+    # car-to-car collisions with the traffic cars (ids start with these prefixes)
+    cmd["obstacles"] = [self.traffic.prefix] + ([self.opp_traffic.prefix] if self.opp_traffic is not None else [])
+    return cmd
+
+  def _poll_input(self, q: dict) -> None:
     """Engine window keys and gamepad (sim_input): WASD / left stick + R2 / L2 drive (and take over from openpilot),
     E / select engage / disengage, +/- / d-pad change the set speed while engaged, R resets, Q quits"""
-    inp = self.api.query().get("input")
+    inp = q.get("input")
     if not inp:
       return
     self.held = inp.get("held", {})
@@ -273,8 +348,8 @@ class ZoomEngineWorld(World):
       # raw IMU axes as locationd expects them: device frame (x fwd, y right, z down) = [-v[2], -v[1], -v[0]]
       state.imu.gyroscope = vec3(self.ego_yaw_rate, 0.0, 0.0)
       # specific force: gravity tilts into the forward axis on hills
-      p = self.ego_pitch
-      state.imu.accelerometer = vec3(GRAVITY * math.cos(p), v * self.ego_yaw_rate, -(self.ego_accel + GRAVITY * math.sin(p)))
+      f = self.ego_specific_force   # the physics car's accelerometer, local (x left, y up, z forward)
+      state.imu.accelerometer = vec3(f[1], f[0], -f[2])
       state.gps.from_xy((self.ego_z, -self.ego_x))  # north = +z, east = -x
       state.valid = True
 
@@ -289,6 +364,7 @@ class ZoomEngineWorld(World):
 
   def reset(self):
     self._reset_ego()
+    self.api.send(self._vehicle_spawn_command("vehicle_reset"))
 
   def close(self, reason: str):
     self.status_q.put(QueueMessage(QueueMessageType.CLOSE_STATUS, reason))
@@ -314,12 +390,9 @@ class ZoomEngineWorld(World):
       cmds = self.traffic.engine_commands((ego[0], ego[1]), frame)
       if self.opp_traffic is not None:
         cmds += self.opp_traffic.engine_commands((ego[0], ego[1]), frame)
-      y, rot = self._ego_height_rotation(ego[4], ego[2])
-      # "smooth": the engine glides between these 50 Hz samples, so the view doesn't stutter at 60-120 fps
-      cmds.append({"action": "move", "id": "ego", "position": [round(ego[0], 3), round(y, 3), round(ego[1], 3)], "smooth": True})
-      cmds.append({"action": "rotate", "id": "ego", "rotation": rot, "smooth": True})
-      if self.chase_camera:
-        cmds.append(self._chase_camera(ego, dt))
+      with self.lock:
+        cmds.append({"action": "vehicle_input", "id": "ego", "throttle": round(self.throttle_cmd, 4), "brake": round(self.brake_cmd, 4),
+                     "steer_deg": round(self.steer_cmd, 3)})
       if frame % 2 == 0:
         self.sm.update(0)
         self._track_engagement(ego)
@@ -335,23 +408,15 @@ class ZoomEngineWorld(World):
         print(f"[zoomengine] {pos}  {ctl}  {status}", flush=True)
       try:
         self.api.batch(cmds)
-        self._poll_input()
+        q = self.api.query()
+        self._poll_input(q)
+        self._read_vehicle(q)
       except OSError:
         print("ZoomEngine went away, stopping")
         self.exit_event.set()
         return
       frame += 1
       time.sleep(max(0.0, period - (time.monotonic() - now)))
-
-  def _chase_camera(self, ego, dt):
-    x, z, psi = ego[0], ego[1], ego[2]
-    h = self.track.height(ego[4])
-    fx, fz = math.sin(psi), math.cos(psi)
-    want = np.array([x - 11.0 * fx, h + 4.2, z - 11.0 * fz])
-    a = 1.0 - math.exp(-dt * 4.0)
-    self.cam_pos = want if self.cam_pos is None else self.cam_pos + a * (want - self.cam_pos)
-    return {"action": "camera", "position": [round(float(c), 3) for c in self.cam_pos], "target": [x + 10.0 * fx, h + 1.2, z + 10.0 * fz],
-            "smooth": True}
 
   @staticmethod
   def _to_ego(x, y, max_x=None):
@@ -414,13 +479,24 @@ class ZoomEngineWorld(World):
        [0.85, 0.85, 0.85]),
       (f"{where}   lap {ego[4]:6.0f} / {self.track.length:.0f} m   collisions {self.collisions} {self.collision_kinds}   {disengaged}",
        [1.0, 0.4, 0.3] if (on_highway and abs(ego[5]) > 2.5) or self.collisions else [0.85, 0.85, 0.85]),
-      ("traffic {name}: {n} cars   cut-ins {cut_ins}   hard brakes {hard_brakes}   brake checks {brake_checks}   merges {merges}".format(
+      ("traffic {name}: {n} cars   cut-ins {cut_ins}   hard brakes {hard_brakes}   brake checks {brake_checks}   merges {merges}   wrecked {crashed}".format(
         name=self.traffic.preset_name, n=len(self.traffic.cars), **self.traffic.stats), [1.0, 0.75, 0.3]),
+      (self._powertrain_line(), [0.55, 0.8, 1.0]),
       ("keys: WASD manual   +/- set speed   E engage/disengage   R reset   Q quit", [0.6, 0.6, 0.6]),
       ("pad: left stick + R2/L2 manual   d-pad set speed   select engage/disengage", [0.6, 0.6, 0.6]),
     ]
     return [{"action": "hud_text", "id": f"hud{i}", "text": t, "pos": [0.015, 0.025 + 0.03 * i], "color": c, "scale": 1.0}
             for i, (t, c) in enumerate(lines)]
+
+  def _powertrain_line(self) -> str:
+    v = self.veh
+    if not v:
+      return "physics car: waiting for the engine"
+    lock = "" if abs(v["clutch_slip_rpm"]) < 60 else f" (converter slip {v['clutch_slip_rpm']:+.0f})"
+    parts = [f"engine {v['rpm']:4.0f} rpm{lock}", f"CVT {v['ratio']:.2f}", f"{v['power_kw']:5.1f} kW",
+             f"throttle {v['throttle']:.2f} brake {v['brake']:.2f}", f"oil {v['oil_temp']:.0f} C {v['oil_pressure']:.1f} bar",
+             f"coolant {v['coolant_temp']:.0f} C", f"fuel {v['fuel_l']:.1f} L ({v['fuel_lph']:.1f} L/h)"]
+    return "   ".join(parts)
 
   def _track_engagement(self, ego) -> None:
     active = self.sm['selfdriveState'].active
