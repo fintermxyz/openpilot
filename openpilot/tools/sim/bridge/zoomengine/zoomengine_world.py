@@ -263,8 +263,7 @@ class ZoomEngineWorld(World):
         name=self.traffic.preset_name, n=len(self.traffic.cars), **self.traffic.stats), [1.0, 0.75, 0.3]),
       ("bridge keys: 1 accel/resume  2 set/decel  3 cancel  S brake  WASD manual  R reset  Q quit", [0.6, 0.6, 0.6]),
     ]
-    # the engine's stroke font only has upper case glyphs
-    return [{"action": "hud_text", "id": f"hud{i}", "text": t.upper(), "pos": [0.015, 0.025 + 0.03 * i], "color": c, "scale": 1.0}
+    return [{"action": "hud_text", "id": f"hud{i}", "text": t, "pos": [0.015, 0.025 + 0.03 * i], "color": c, "scale": 1.0}
             for i, (t, c) in enumerate(lines)]
 
   def _track_engagement(self, ego) -> None:
