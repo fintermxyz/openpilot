@@ -1,4 +1,5 @@
 import json
+import os
 import socket
 import time
 from multiprocessing import Queue
@@ -45,6 +46,14 @@ class CrossroadsCarWorld(ZoomEngineWorld):
     self.sock.setblocking(False)
     self.trial = -1
     self.parked = False
+    # L3 research layer, simulator only: built before the engine thread starts (the import goes through the sim-only gate)
+    self.l3 = None
+    if os.environ.get("L3") == "1":
+      from openpilot.tools.sim.l3 import msgs as l3_msgs
+      from openpilot.tools.sim.l3.host import L3Host
+      self.l3_msgs = l3_msgs
+      self.l3 = L3Host(self.EGO_ID, self.route_name, self.cmap)
+      self.l3_mode = ""
     super().__init__(status_q, dual_camera=False, port=port, chase_camera=False)
 
   @property
@@ -95,8 +104,13 @@ class CrossroadsCarWorld(ZoomEngineWorld):
       self.sm.update(0)
       self._track_engagement(ego)
       cmds += self._overlay_commands()
+    if frame % 10 == 0 and self.l3 is not None:
+      cmds += self._l3_hud_commands()
     pose = {"car": self.car, "route": self.route_name, "trial": self.trial, "x": ego[0], "z": ego[1], "psi": ego[2], "v": ego[3],
             "s": ego[4], "d": ego[5], "engaged": self.op_active, "parked": self.parked, "t": time.monotonic()}
+    if self.l3 is not None:
+      pose["l3"] = self.l3.status()
+      pose["l3_stats"] = self.l3.stats()  # for the director's results, not relayed to the other cars
     try:
       self.sock.sendto(json.dumps(pose).encode(), self.director)
     except OSError:
@@ -106,6 +120,23 @@ class CrossroadsCarWorld(ZoomEngineWorld):
       print(f"[crossroads car {self.car}] {where}  engaged {self.op_active}  disengagements {self.disengagements}", flush=True)
     return cmds
 
+  def _l3_tick(self) -> None:
+    # control thread, self.lock held (ZoomEngineWorld.apply_controls)
+    st = self.l3_msgs.EgoState(t=time.monotonic(), id=self.EGO_ID, route=self.route_name, x=self.ego_x, z=self.ego_z, psi=self.ego_psi,
+                               v=self.ego_v, a=self.ego_accel, s=self.ego_s, d=self.ego_d, op_active=self.op_active)
+    self.l3.tick(st)  # never raises: a failure latches the arbiter's FAILSAFE
+    mode = self.l3.mode
+    if mode != self.l3_mode:
+      print(f"[l3 car {self.car}] mode {self.l3_mode or '--'} -> {mode} {self.l3.reason}", flush=True)
+      self.l3_mode = mode
+
+  def _l3_hud_commands(self) -> list[dict]:
+    """this car's L3 state on the shared engine HUD: one line per car (ids prefixed per car), between the picture-in-pictures"""
+    lines = self.l3.hud_lines()
+    text = f"car {self.car + 1}  " + "   ".join(t for t, _ in lines)
+    return [{"action": "hud_text", "id": f"{self.OVERLAY_PREFIX}l3", "text": text, "pos": [0.27, 0.115 + 0.03 * self.car],
+             "color": lines[0][1], "scale": 0.9}]
+
   def _handle_director(self) -> bool:
     """True if the director started a new trial (ego was reset)"""
     reset = False
@@ -114,6 +145,12 @@ class CrossroadsCarWorld(ZoomEngineWorld):
         msg = json.loads(self.sock.recv(4096))
       except (BlockingIOError, ValueError):
         return reset
+      if self.l3 is not None and msg.get("type") == "world":
+        try:
+          self.l3.feed(self.l3_msgs.WorldMsg.from_json(msg))
+        except (KeyError, TypeError, ValueError) as e:
+          print(f"[l3 car {self.car}] bad world message: {e!r}", flush=True)
+        continue
       if "reset" in msg and msg["reset"] != self.trial:
         self.trial = msg["reset"]
         self.parked = False

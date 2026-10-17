@@ -1,3 +1,4 @@
+import json
 import math
 import os
 import threading
@@ -41,7 +42,12 @@ COLLIDER_MATERIALS = ["Road_", "Terrain", "Concrete", "Rail_"]   # BeamNG mesh m
 # longitudinal "ECU": openpilot asks for an acceleration, the car needs pedals
 LONG_KP, LONG_KI = 0.25, 0.4
 WHEEL_POWER_W = 103e3   # ~ max power at the wheels, for the throttle feedforward
+SPAWN_TOL_M = 10.0      # m: after a reset, engine poses this far from the spawn are from before it
+SPAWN_WAIT_S = 1.0      # s: ... for at most this long
 KEY_BRAKE = 0.5         # S / down: firm braking; Space: full
+L3_HOLD_V = 0.3         # m/s: L3 FAILSAFE holds the brake once stopped
+L3_TICK_S = 0.04        # s: the L3 host ticks at 25 Hz on the control thread (not the engine I/O thread: an engine round trip
+                        # that stalls must not starve L3 and trip its watchdog)
 
 # manual driving from the engine window (keys polled from the agent API, see _poll_input)
 MAX_LAT_ACCEL = 4.0      # m/s^2, full A/D lock at speed
@@ -113,6 +119,14 @@ class ZoomEngineWorld(World):
     self.taps: dict[str, int] | None = None
     self.manual_steer = 0.0
     self.manual_t = time.monotonic()
+    # optional L3 layer (tools/sim/l3, simulator only): a subclass sets it before this __init__ or right after
+    self.l3 = getattr(self, "l3", None)
+    self._l3_next_tick = 0.0
+    self._l3_log = None
+    if self.l3 is not None and os.environ.get("L3_LOG_DIR"):
+      # per-apply arbiter log (PLAN M1 exit 5: a_out <= a_op outside FAILSAFE / a_min_keep): one JSON line per control tick
+      os.makedirs(os.environ["L3_LOG_DIR"], exist_ok=True)
+      self._l3_log = open(os.path.join(os.environ["L3_LOG_DIR"], f"l3_{self.EGO_ID}.jsonl"), "a", buffering=1 << 16)
     self.engine_thread = threading.Thread(target=self._engine_loop, daemon=True)
     self.engine_thread.start()
     self.status_q.put(QueueMessage(QueueMessageType.START_STATUS, "started"))
@@ -212,6 +226,8 @@ class ZoomEngineWorld(World):
       self.ego_pitch = self.track.pitch(self.START_S)
       self.last_t = time.monotonic()
       self.reset_time = self.last_t
+      # until the engine's physics car shows up at the spawn, its reports are the pose from before the reset
+      self.await_spawn = (self.ego_x, self.ego_z, self.last_t)
 
   # ---- vehicle ----
   def _driver_steer(self) -> float:
@@ -233,14 +249,41 @@ class ZoomEngineWorld(World):
       # the driver has taken over (engine window keys / gamepad) or is holding a driving key
       if not self.op_active and not self.driver_took_over and not self.manual_held and abs(steer_angle) < 1e-6:
         steer_angle = self._driver_steer()
+      l3_out = None
+      if self.l3 is not None and now >= self._l3_next_tick:
+        self._l3_next_tick = now + L3_TICK_S - 0.005
+        self._l3_tick()  # under self.lock: serialized with reset() and the ego state it reads
+      if self.op_active and self.l3 is not None:
+        # L3 arbiter: min(openpilot, L3 cap), COMMIT floor, brake hold, FAILSAFE (map pure pursuit steering)
+        l3_out = self.l3.arbiter.apply(float(self.sm['carControl'].actuators.accel), now, dt, v=self.ego_v)
+        if l3_out.steer_source == "map_pp":
+          steer_angle = self._driver_steer()
       self.steer_cmd = float(steer_angle)
       if self.op_active:
         # openpilot drives: turn its acceleration request into pedals like the car's powertrain ECU
-        throttle_out, brake_out = self._pedals_for_accel(float(self.sm['carControl'].actuators.accel), dt)
+        a_req = float(self.sm['carControl'].actuators.accel) if l3_out is None else l3_out.accel
+        throttle_out, brake_out = self._pedals_for_accel(a_req, dt)
+        if l3_out is not None and (l3_out.brake_hold or (l3_out.failsafe and self.ego_v < L3_HOLD_V)):
+          self.long_i = 0.0
+          throttle_out, brake_out = 0.0, 1.0
       else:
         self.long_i = 0.0
+        if self.l3 is not None and not self.driver_took_over and not self.manual_held:
+          # the bridge's own driver (before openpilot engages, or while it's re-engaging) obeys L3's junction rules too
+          cmd = self.l3.last_cmd
+          if cmd is not None and (cmd.brake_hold or cmd.a_cap < 0.0):
+            if cmd.brake_hold or self.ego_v < L3_HOLD_V:
+              throttle_out, brake_out = 0.0, 1.0
+            else:
+              throttle_out, brake_out = self._pedals_for_accel(max(cmd.a_cap, cmd.a_floor), dt)
+              self.long_i = 0.0
       self.throttle_cmd, self.brake_cmd = float(throttle_out), float(brake_out)
       self.accel_cmd = self.ego_accel
+      if self._l3_log is not None and l3_out is not None:
+        a_op = float(self.sm['carControl'].actuators.accel)
+        self._l3_log.write(json.dumps({"t": round(now, 3), "trial": getattr(self, "trial", None), "a_op": a_op, "a_out": l3_out.accel,
+                                       "source": l3_out.source, "hold": l3_out.brake_hold, "failsafe": l3_out.failsafe,
+                                       "throttle": self.throttle_cmd, "brake": self.brake_cmd, "steer": self.steer_cmd}) + "\n")
     # the engine simulates the car: commands go out and its state comes back in _engine_loop
 
   def _pedals_for_accel(self, a_req: float, dt: float) -> tuple[float, float]:
@@ -284,6 +327,11 @@ class ZoomEngineWorld(World):
     if not v:
       return
     with self.lock:
+      if self.await_spawn is not None:
+        x0, z0, t0 = self.await_spawn
+        if math.hypot(v["position"][0] - x0, v["position"][2] - z0) > SPAWN_TOL_M and time.monotonic() - t0 < SPAWN_WAIT_S:
+          return  # the reset hasn't reached the physics car yet: a stale pose would read as a jump back to the old place
+        self.await_spawn = None
       self.veh = v
       self.ego_x, self.ego_y, self.ego_z = v["position"]
       self.ego_psi, self.ego_pitch, self.ego_v = v["heading"], v["pitch"], v["speed"]
@@ -383,8 +431,14 @@ class ZoomEngineWorld(World):
   def tick(self):
     pass
 
+  def _l3_tick(self) -> None:
+    """one L3 host tick, called with self.lock held (a subclass that runs L3 builds the EgoState)"""
+
   def reset(self):
     self._reset_ego()
+    if self.l3 is not None:
+      with self.lock:  # serialized with the L3 tick and the arbiter on the control thread
+        self.l3.reset(getattr(self, "trial", None))  # signal latch, junction FSM, arbiter FAILSAFE latch, the trial
     self.api.send(self._vehicle_spawn_command("vehicle_reset"))
 
   def close(self, reason: str):
@@ -513,6 +567,8 @@ class ZoomEngineWorld(World):
       ("keys: WASD manual   +/- set speed   E engage/disengage   R reset   Q quit", [0.6, 0.6, 0.6]),
       ("pad: left stick + R2/L2 manual   d-pad set speed   select engage/disengage", [0.6, 0.6, 0.6]),
     ]
+    if self.l3 is not None:
+      lines += self.l3.hud_lines()
     return [{"action": "hud_text", "id": f"hud{i}", "text": t, "pos": [0.015, 0.025 + 0.03 * i], "color": c, "scale": 1.0}
             for i, (t, c) in enumerate(lines)]
 
