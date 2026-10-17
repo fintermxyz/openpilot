@@ -51,6 +51,10 @@ class CrossroadsCarWorld(ZoomEngineWorld):
   def lanes(self) -> tuple:
     return (0.0,)  # the route is the lane centre
 
+  def _obstacles(self) -> list[str]:
+    # car-to-car crashes with the other openpilot cars' bodies (top-level ids, so not their wheels / lights)
+    return [f"op{c}" for c in range(len(ROUTES)) if c != self.car]
+
   def _setup_world(self, map_path, traffic, seed) -> None:
     self.map = None
     self.traffic = None
@@ -64,19 +68,21 @@ class CrossroadsCarWorld(ZoomEngineWorld):
     api.send({"action": "sensor_camera_remove", "id": self.CAM_IDS[0]})
     y, rot = self._ego_height_rotation(self.ego_s, self.ego_psi)
     api.batch(car_commands(self.EGO_ID, "sedan", CAR_COLORS[self.car], self.ego_x, self.ego_z, self.ego_psi, y0=y, rotation=rot))
+    api.send(self._vehicle_spawn_command("vehicle"))  # the engine's physics Civic drives this body
     api.send({"action": "sensor_camera", "id": self.CAM_IDS[0], "attach": self.EGO_ID, "offset": [0, CAM_HEIGHT - CAR_Y, self.CAM_FORWARD_M],
               "yaw": 0, "pitch": 0, "width": W, "height": H, "hz": 20, "hfov": 40, "shm": self.SHM_PATHS[0],
               "format": "nv12", "nv12": list(get_nv12_info(W, H)), "pip": PIPS[self.car],
               "label": f"car {self.car + 1} {self.route_name.replace('_', ' to ')} (openpilot {self.car + 1})"})
     print(f"---- crossroads car {self.car} ({self.route_name}) ready, route {self.track.length:.0f} m ----", flush=True)
 
-  def _poll_input(self) -> None:
+  def _poll_input(self, q: dict) -> None:
     pass  # the engine window's keys belong to the director
 
   def apply_controls(self, steer_angle, throttle_out, brake_out):
-    if self.parked:  # reached the end of the route: wait for the next trial
-      throttle_out, brake_out = 0.0, 1.0
     super().apply_controls(steer_angle, throttle_out, brake_out)
+    if self.parked:  # reached the end of the route: wait for the next trial (overrides openpilot's pedals too)
+      with self.lock:
+        self.throttle_cmd, self.brake_cmd = 0.0, 1.0
 
   def _engine_step(self, ego, dt: float, frame: int) -> list[dict]:
     if self._handle_director():
@@ -84,9 +90,7 @@ class CrossroadsCarWorld(ZoomEngineWorld):
         ego = (self.ego_x, self.ego_z, self.ego_psi, self.ego_v, self.ego_s, self.ego_d)
     if ego[4] > self.track.length - 8.0:
       self.parked = True
-    y, rot = self._ego_height_rotation(ego[4], ego[2])
-    cmds = [{"action": "move", "id": self.EGO_ID, "position": [round(ego[0], 3), round(y, 3), round(ego[1], 3)], "smooth": True},
-            {"action": "rotate", "id": self.EGO_ID, "rotation": rot, "smooth": True}]
+    cmds = [self._vehicle_input_command()]
     if frame % 2 == 0:
       self.sm.update(0)
       self._track_engagement(ego)
@@ -113,7 +117,7 @@ class CrossroadsCarWorld(ZoomEngineWorld):
       if "reset" in msg and msg["reset"] != self.trial:
         self.trial = msg["reset"]
         self.parked = False
-        self._reset_ego()
+        self.reset()  # ego state + the engine's physics car back to the spawn
         reset = True
 
 

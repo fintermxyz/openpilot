@@ -39,6 +39,20 @@ class CrossroadsMap:
       spawn = float(self.data.get("spawns", {}).get(name, {}).get("s", 15.0))
       self.routes[name] = Route(name, r["phase"], track, float(r["stop_line_s"]), tuple(r["junction_s"]), spawn)
 
+  def collider_commands(self) -> list[dict]:
+    """what the physics cars drive on: the road sections' asphalt, kerbs and footways (not the 20 mm markings), and the ground"""
+    cmds = []
+    for i, st in enumerate(self.data["statics"]):
+      cmds.append({"action": "mesh_collider", "id": f"kit_collider{i}", "gltf": os.path.join(self.root, st["path"]),
+                   "materials": ["asphalt", "kerb", "footway"], "position": st["position"], "rotation": st.get("rotation", [0, 0, 0]),
+                   "scale": st.get("scale", [1, 1, 1]), "material": "default"})
+    g = self.data.get("ground")
+    if g:
+      w, d, y = float(g["size"][0]) / 2, float(g["size"][1]) / 2, float(g.get("y", -0.02))
+      cmds.append({"action": "mesh_collider", "id": "ground_collider", "material": "default", "indices": [0, 2, 1, 0, 3, 2],
+                   "verts": [-w, y, -d, w, y, -d, w, y, d, -w, y, d]})
+    return cmds
+
   def scene_commands(self) -> list[dict]:
     cmds = []
     g = self.data.get("ground")
@@ -49,6 +63,7 @@ class CrossroadsMap:
     for i, st in enumerate(self.data["statics"]):
       cmds.append({"action": "create", "type": "gltf", "id": f"kit{i}", "path": os.path.join(self.root, st["path"]),
                    "position": st["position"], "rotation": st.get("rotation", [0, 0, 0]), "scale": st.get("scale", [1, 1, 1])})
+    cmds += self.collider_commands()
     for sig in self.data["signals"]:
       cmds += signal_commands(sig)
     return cmds
