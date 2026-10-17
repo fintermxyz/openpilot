@@ -1,0 +1,301 @@
+import math
+import threading
+import time
+
+import numpy as np
+
+from opendbc.car.honda.interface import CarInterface
+from opendbc.car.vehicle_model import VehicleModel
+from openpilot.cereal import messaging
+from openpilot.tools.sim.bridge.common import QueueMessage, QueueMessageType
+from openpilot.tools.sim.bridge.zoomengine.scene import CAR_Y, car_commands, deg, props_commands, road_commands
+from openpilot.tools.sim.bridge.zoomengine.track import Track
+from openpilot.tools.sim.bridge.zoomengine.traffic import Traffic
+from openpilot.tools.sim.bridge.zoomengine.zoom_api import SensorReader, ZoomAPI
+from openpilot.tools.sim.lib.common import SimulatorState, World, vec3
+from openpilot.tools.sim.lib.camerad import W, H
+
+# the plant is openpilot's own vehicle model of the car launch_openpilot.sh fingerprints as
+CAR_FINGERPRINT = "HONDA_CIVIC_2022"
+STEER_RATE = 300.  # deg/s of steering wheel
+GRAVITY = 9.81
+
+CAM_HEIGHT = 1.22      # comma device height above the road
+CAM_FORWARD = 0.6      # mount position ahead of the car center
+EGO_START_S = 100.0
+EGO_START_SPEED = 20.0
+
+SHM_ROAD = "/tmp/zoom_sensor_road.bin"
+SHM_WIDE = "/tmp/zoom_sensor_wide.bin"
+
+ENGINE_HZ = 50
+
+
+class ZoomEngineWorld(World):
+  def __init__(self, status_q, dual_camera: bool, port: int = 9090, seed: int = 0, traffic: str = "heavy", chase_camera: bool = True):
+    super().__init__(dual_camera)
+    self.status_q = status_q
+    self.chase_camera = chase_camera
+    self.status_q.put(QueueMessage(QueueMessageType.START_STATUS, "starting"))
+
+    self.api = ZoomAPI(port=port)
+    print(f"---- waiting for ZoomEngine on {self.api.url} ----")
+    self.api.wait_ready()
+
+    self.VM = VehicleModel(CarInterface.get_non_essential_params(CAR_FINGERPRINT))
+    self.track = Track()
+    self.lock = threading.Lock()
+    self.rng = np.random.default_rng(seed)
+    self.traffic = Traffic(self.track, self.rng, EGO_START_S, traffic)
+    self._reset_ego()
+    self._build_scene()
+
+    self.road_reader = SensorReader(SHM_ROAD, W, H)
+    self.wide_reader = SensorReader(SHM_WIDE, W, H) if dual_camera else None
+
+    self.sm = messaging.SubMaster(['modelV2', 'selfdriveState', 'carControl', 'carState', 'radarState', 'onroadEvents'])
+    self.cam_pos = None
+    self.collisions = 0
+    self.was_colliding = False
+    self.collision_kinds = {"ego": 0, "npc": 0, "cut-in": 0}
+    # disengagement tracking, the bridge re-engages unless the disengagement was user initiated
+    self.was_active = False
+    self.disengaged_at: float | None = None
+    self.user_disengaged = False
+    self.disengagements = 0
+    self.last_disengage_reason = ""
+    self.engine_thread = threading.Thread(target=self._engine_loop, daemon=True)
+    self.engine_thread.start()
+    self.status_q.put(QueueMessage(QueueMessageType.START_STATUS, "started"))
+
+  # ---- scene ----
+  def _build_scene(self):
+    api = self.api
+    api.send({"action": "clear"})
+    for cam_id in ("road", "wide"):
+      api.send({"action": "sensor_camera_remove", "id": cam_id})
+    cmds = road_commands(self.track) + props_commands(self.track, self.rng) + self.traffic.create_commands()
+    x, z, psi = self.ego_x, self.ego_z, self.ego_psi
+    cmds += car_commands("ego", "sedan", [0.92, 0.93, 0.95], x, z, psi, sensor_hidden=True)
+    api.batch(cmds)
+
+    pip_w = 0.32
+    pip_h = pip_w * H / W * 16 / 9  # keep the camera aspect on a 16:9 window
+    cam = {"action": "sensor_camera", "attach": "ego", "offset": [0, CAM_HEIGHT - CAR_Y, CAM_FORWARD], "yaw": 0, "pitch": 0,
+           "width": W, "height": H, "hz": 20}
+    api.send({**cam, "id": "road", "hfov": 40, "shm": SHM_ROAD, "pip": [0.67, 0.02, pip_w, pip_h], "label": "road camera (openpilot input)"})
+    if self.dual_camera:
+      api.send({**cam, "id": "wide", "hfov": 120, "shm": SHM_WIDE, "pip": [0.67, 0.04 + pip_h, pip_w, pip_h],
+                "label": "wide camera (openpilot input)"})
+    print(f"---- ZoomEngine scene built: {len(cmds)} objects, track {self.track.length:.0f} m ----")
+
+  def _reset_ego(self):
+    with self.lock:
+      self.ego_x, self.ego_z, self.ego_psi = self.track.pose(EGO_START_S, 0.0)
+      self.ego_v = EGO_START_SPEED
+      self.ego_yaw_rate = 0.0
+      self.ego_accel = 0.0
+      self.steer_deg = 0.0
+      self.steer_cmd = 0.0
+      self.accel_cmd = 0.0
+      self.ego_s, self.ego_d = EGO_START_S, 0.0
+      self.last_t = time.monotonic()
+      self.reset_time = self.last_t
+
+  # ---- vehicle ----
+  def apply_controls(self, steer_angle, throttle_out, brake_out):
+    with self.lock:
+      now = time.monotonic()
+      dt = min(0.05, now - self.last_t)
+      self.last_t = now
+      self.steer_cmd = float(steer_angle)
+      self.accel_cmd = 1.6 * float(throttle_out) - 4.0 * float(brake_out)
+
+      self.steer_deg += float(np.clip(self.steer_cmd - self.steer_deg, -STEER_RATE * dt, STEER_RATE * dt))
+      v = self.ego_v
+      drag = 0.02 + 0.0004 * v * v if v > 0.1 else 0.0
+      self.ego_v = max(0.0, v + (self.accel_cmd - drag) * dt)
+      self.ego_accel = (self.ego_v - v) / dt if dt > 0 else 0.0
+      self.ego_yaw_rate = self.ego_v * self.VM.calc_curvature(math.radians(self.steer_deg), self.ego_v, 0.0)
+      self.ego_psi += self.ego_yaw_rate * dt
+      self.ego_x += self.ego_v * math.sin(self.ego_psi) * dt
+      self.ego_z += self.ego_v * math.cos(self.ego_psi) * dt
+      self.ego_s, self.ego_d = self.track.project(self.ego_x, self.ego_z, self.ego_s)
+
+  def read_state(self):
+    pass
+
+  def read_sensors(self, state: SimulatorState):
+    with self.lock:
+      v, psi = self.ego_v, self.ego_psi
+      state.velocity = vec3(v * math.sin(psi), v * math.cos(psi), 0.0)
+      state.bearing = (-math.degrees(psi)) % 360
+      state.imu.bearing = state.bearing
+      state.steering_angle = self.steer_deg
+      # raw IMU axes as locationd expects them: device frame (x fwd, y right, z down) = [-v[2], -v[1], -v[0]]
+      state.imu.gyroscope = vec3(self.ego_yaw_rate, 0.0, 0.0)
+      state.imu.accelerometer = vec3(GRAVITY, v * self.ego_yaw_rate, -self.ego_accel)
+      state.gps.from_xy((self.ego_z, -self.ego_x))  # north = +z, east = -x
+      state.valid = True
+
+  def read_cameras(self):
+    if self.wide_reader is not None:
+      self.wide_reader.read(self.wide_road_image)
+    if self.road_reader.read(self.road_image):
+      self.image_lock.release()  # wakes the camerad thread to send the new frame
+
+  def tick(self):
+    pass
+
+  def reset(self):
+    self._reset_ego()
+
+  def close(self, reason: str):
+    self.status_q.put(QueueMessage(QueueMessageType.CLOSE_STATUS, reason))
+    self.exit_event.set()
+    self.road_reader.close()
+    if self.wide_reader is not None:
+      self.wide_reader.close()
+
+  # ---- engine sync: traffic, ego pose, chase camera, overlays ----
+  def _engine_loop(self):
+    period = 1.0 / ENGINE_HZ
+    frame = 0
+    last = time.monotonic()
+    while not self.exit_event.is_set():
+      now = time.monotonic()
+      dt, last = now - last, now
+      with self.lock:
+        ego = (self.ego_x, self.ego_z, self.ego_psi, self.ego_v, self.ego_s, self.ego_d)
+      self.traffic.step(dt, (ego[4], ego[5], ego[3]))
+
+      cmds = self.traffic.engine_commands(ego[4], frame)
+      cmds.append({"action": "move", "id": "ego", "position": [round(ego[0], 3), CAR_Y, round(ego[1], 3)]})
+      cmds.append({"action": "rotate", "id": "ego", "rotation": [0, deg(ego[2]), 0]})
+      if self.chase_camera:
+        cmds.append(self._chase_camera(ego, dt))
+      if frame % 2 == 0:
+        self.sm.update(0)
+        self._track_engagement(ego)
+        cmds += self._overlay_commands()
+      if frame % 10 == 0:
+        cmds += self._hud_commands(ego)
+      if frame % ENGINE_HZ == 0:
+        pos = f"s {ego[4]:7.1f} m  lane offset {ego[5]:+6.2f} m  v {ego[3]:5.2f} m/s"
+        ctl = f"steer {self.steer_deg:+6.2f} (cmd {self.steer_cmd:+6.2f}) deg  accel cmd {self.accel_cmd:+5.2f}"
+        lead = self.sm['radarState'].leadOne
+        lead_str = f"{lead.dRel:5.1f} m" if lead.present else "--"
+        status = f"lead {lead_str}  collisions {self.collisions}  disengagements {self.disengagements}  {self.traffic.stats}"
+        print(f"[zoomengine] {pos}  {ctl}  {status}", flush=True)
+      try:
+        self.api.batch(cmds)
+      except OSError:
+        print("ZoomEngine went away, stopping")
+        self.exit_event.set()
+        return
+      frame += 1
+      time.sleep(max(0.0, period - (time.monotonic() - now)))
+
+  def _chase_camera(self, ego, dt):
+    x, z, psi = ego[0], ego[1], ego[2]
+    fx, fz = math.sin(psi), math.cos(psi)
+    want = np.array([x - 11.0 * fx, 4.2, z - 11.0 * fz])
+    a = 1.0 - math.exp(-dt * 4.0)
+    self.cam_pos = want if self.cam_pos is None else self.cam_pos + a * (want - self.cam_pos)
+    return {"action": "camera", "position": [round(float(c), 3) for c in self.cam_pos], "target": [x + 10.0 * fx, 1.2, z + 10.0 * fz]}
+
+  @staticmethod
+  def _to_ego(x, y, max_x=None):
+    """device frame (x fwd, y right) -> ego object local frame (+x left, +y up, +z fwd) at road level"""
+    pts = []
+    for xi, yi in zip(x, y, strict=True):
+      if max_x is not None and xi > max_x:
+        break
+      pts.append([round(-yi, 3), round(0.03 - CAR_Y, 3), round(xi + CAM_FORWARD, 3)])
+    return pts
+
+  def _overlay_commands(self) -> list[dict]:
+    if not self.sm.updated['modelV2'] and self.sm.recv_frame['modelV2'] == 0:
+      return []
+    md = self.sm['modelV2']
+    engaged = self.sm['selfdriveState'].active
+    cmds = []
+    if len(md.position.x):
+      color = [0.1, 0.9, 0.35, 0.55] if engaged else [0.9, 0.9, 0.9, 0.45]
+      cmds.append({"action": "overlay_path", "id": "plan", "attach": "ego", "points": self._to_ego(md.position.x, md.position.y, 120.0),
+                   "color": color, "width": 1.0})
+    for i, (line, prob) in enumerate(zip(md.laneLines, md.laneLineProbs, strict=False)):
+      if len(line.x):
+        cmds.append({"action": "overlay_path", "id": f"lane{i}", "attach": "ego", "points": self._to_ego(line.x, line.y, 100.0),
+                     "color": [1.0, 1.0, 1.0, round(0.15 + 0.7 * float(prob), 3)], "width": 0.12})
+    for i, edge in enumerate(md.roadEdges):
+      if len(edge.x):
+        cmds.append({"action": "overlay_path", "id": f"edge{i}", "attach": "ego", "points": self._to_ego(edge.x, edge.y, 100.0),
+                     "color": [1.0, 0.15, 0.15, 0.6], "width": 0.12})
+    lead = self.sm['radarState'].leadOne
+    if lead.present:
+      d, y = lead.dRel, lead.yRel
+      cmds.append({"action": "overlay_path", "id": "lead", "attach": "ego",
+                   "points": self._to_ego([d - 1.2, d], [-y, -y]), "color": [1.0, 0.25, 0.1, 0.8], "width": 2.0})
+    else:
+      cmds.append({"action": "overlay_path_remove", "id": "lead"})
+    return cmds
+
+  def _hud_commands(self, ego) -> list[dict]:
+    ss, cs, cc = self.sm['selfdriveState'], self.sm['carState'], self.sm['carControl']
+    lead = self.sm['radarState'].leadOne
+    state = "ENGAGED" if ss.active else ("ready, press 2 to engage" if ss.engageable else "not ready")
+    set_speed = f"{cs.vCruise:.0f} km/h" if ss.active else "--"
+    colliding = self._colliding(ego)
+    if colliding and not self.was_colliding:
+      self.collisions += 1
+      self.collision_kinds[colliding] += 1
+    self.was_colliding = colliding is not None
+    lead_str = f"{lead.dRel:5.1f} m" if lead.present else "  --  "
+    disengaged = f"disengagements {self.disengagements} {self.last_disengage_reason}"
+    lines = [
+      (f"openpilot {state}   speed {ego[3] * 3.6:5.1f} km/h   set {set_speed}", [0.2, 1.0, 0.4] if ss.active else [1.0, 1.0, 1.0]),
+      (f"steer {self.steer_deg:+6.1f} deg (cmd {self.steer_cmd:+6.1f})   accel cmd {cc.actuators.accel:+5.2f} m/s^2   lead {lead_str}",
+       [0.85, 0.85, 0.85]),
+      (f"lane offset {ego[5]:+5.2f} m   lap {ego[4]:6.0f} / {self.track.length:.0f} m   collisions {self.collisions} {self.collision_kinds}   {disengaged}",
+       [1.0, 0.4, 0.3] if abs(ego[5]) > 2.5 or self.collisions else [0.85, 0.85, 0.85]),
+      ("traffic {name}: {n} cars   cut-ins {cut_ins}   hard brakes {hard_brakes}   brake checks {brake_checks}   merges {merges}".format(
+        name=self.traffic.preset_name, n=len(self.traffic.cars), **self.traffic.stats), [1.0, 0.75, 0.3]),
+      ("bridge keys: 1 accel/resume  2 set/decel  3 cancel  S brake  WASD manual  R reset  Q quit", [0.6, 0.6, 0.6]),
+    ]
+    # the engine's stroke font only has upper case glyphs
+    return [{"action": "hud_text", "id": f"hud{i}", "text": t.upper(), "pos": [0.015, 0.025 + 0.03 * i], "color": c, "scale": 1.0}
+            for i, (t, c) in enumerate(lines)]
+
+  def _track_engagement(self, ego) -> None:
+    active = self.sm['selfdriveState'].active
+    if self.was_active and not active:
+      events = self.sm['onroadEvents']
+      self.disengagements += 1
+      self.user_disengaged = any(e.userDisable for e in events)
+      self.last_disengage_reason = ",".join(str(e.name) for e in events if e.userDisable or e.immediateDisable or e.softDisable)
+      self.disengaged_at = time.monotonic()
+      print(f"[zoomengine] DISENGAGED at s {ego[4]:.0f} m, v {ego[3]:.1f} m/s, events: {[str(e.name) for e in events]}", flush=True)
+    elif active:
+      self.disengaged_at = None
+    self.was_active = active
+
+  def disengaged_for(self) -> float:
+    """seconds since openpilot disengaged on its own, 0 while engaged or after a user disengagement"""
+    if self.disengaged_at is None or self.user_disengaged:
+      return 0.0
+    return time.monotonic() - self.disengaged_at
+
+  def _colliding(self, ego) -> str | None:
+    """who is at fault if ego is touching a car: 'ego' (ego rear-ended it), 'npc' (it rear-ended ego) or 'cut-in'"""
+    for car in self.traffic.cars:
+      if car.opposing:
+        continue
+      ds = (car.s - ego[4] + self.track.length / 2) % self.track.length - self.track.length / 2
+      if abs(ds) < car.half_length + 2.3 and abs(car.d - ego[5]) < 1.85:
+        kind = "cut-in" if car.lc_t >= 0 else ("ego" if ds > 0 else "npc")
+        if not self.was_colliding:
+          rel = f"{car.cid} v {car.v:.1f} m/s, gap {ds:+.1f} m, lateral {car.d - ego[5]:+.1f} m"
+          print(f"[zoomengine] COLLISION ({kind}) at s {ego[4]:.0f} m: ego v {ego[3]:.1f} m/s, {rel}", flush=True)
+        return kind
+    return None
