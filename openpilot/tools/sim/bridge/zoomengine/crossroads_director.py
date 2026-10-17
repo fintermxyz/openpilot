@@ -13,6 +13,7 @@ import time
 
 from openpilot.tools.sim.bridge.zoomengine.crossroads import CAR_HALF, ROUTES, CrossroadsMap, SignalController, footprint, lamp_commands, overlap
 from openpilot.tools.sim.bridge.zoomengine.crossroads_car import CAR_PORT_BASE, DIRECTOR_PORT
+from openpilot.tools.sim.bridge.zoomengine.crossroads_scenarios import SCENARIOS, verdict
 from openpilot.tools.sim.bridge.zoomengine.zoom_api import ZoomAPI
 
 HZ = 20
@@ -23,15 +24,19 @@ ACCEL_TAU = 0.2  # s, low-pass on the finite-difference accel of each car
 BOX_STOP_V = 0.2  # m/s inside the junction box counts as a standstill there
 DEADLOCK_V = 0.1  # m/s: every car slower than this ...
 DEADLOCK_S = 20.0  # ... for this long before all have crossed is a deadlock
+LINE_STOP_V, LINE_STOP_D = 0.5, 6.0  # m/s, m: a standstill this close before its stop line is a stop there (front bumper)
 L3_KEYS = ("mode", "jx_state", "t_stop", "token")  # the l3 fields the feed must carry if the whole dict doesn't fit
 
 
 class Director:
-  def __init__(self, map_path: str, cars: int, fault_at: float, trial_len: float, port: int = 9090, seed: int | None = None,
-               trials: int = 0, out: str = "/tmp/crossroads_results.json", l3_mask: str | None = None):
+  def __init__(self, map_path: str, cars: int, fault_at: float | None, trial_len: float, port: int = 9090, seed: int | None = None,
+               trials: int = 0, out: str = "/tmp/crossroads_results.json", l3_mask: str | None = None, scenario: str = "stuck_green"):
     self.cmap = CrossroadsMap(map_path)
     self.cars = cars
-    self.fault_at = fault_at
+    self.sc = SCENARIOS[scenario]
+    self.fault_at_override = fault_at  # None: the scenario draws it per trial
+    self.fault_at = -1.0  # this trial's
+    self.plan: dict = {}
     self.trial_len = trial_len
     self.seed = seed
     self.trials = trials  # 0: run trials until killed
@@ -41,6 +46,7 @@ class Director:
       random.seed(seed)
     self.api = ZoomAPI(port=port)
     self.signals = SignalController()
+    self.signals.fault_mode = self.sc.fault or "stuck_green"
     self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     self.sock.bind(("127.0.0.1", DIRECTOR_PORT))
     self.sock.setblocking(False)
@@ -71,11 +77,17 @@ class Director:
     self.trial_t0 = time.monotonic()
     self.signals.fault = False
     self.still_since = None
-    self.outcome = {"trial": self.trial, "fault_at": self.fault_at, "collisions": [], "cars": {}, "seed": self.seed, "l3_mask": self.l3_mask,
-                    "deadlock": False, "deadlock_at": None}
+    self.plan = self.sc.plan(self.trial, self.seed, self.cars)
+    if self.fault_at_override is not None:
+      self.plan["fault_at"] = self.fault_at_override
+    self.fault_at = self.plan["fault_at"] if self.sc.fault is not None else -1.0
+    self.outcome = {"trial": self.trial, "scenario": self.sc.name, "plan": self.plan, "fault_at": self.fault_at, "fault_t": None,
+                    "collisions": [], "cars": {}, "seed": self.seed, "l3_mask": self.l3_mask, "deadlock": False, "deadlock_at": None}
     for car in range(self.cars):
-      self.sock.sendto(json.dumps({"reset": self.trial}).encode(), ("127.0.0.1", CAR_PORT_BASE + car))
-    print(f"[director] trial {self.trial} started", flush=True)
+      spawn_s = self.cmap.routes[ROUTES[car]].spawn_s + self.plan["spawn_ahead"][car]
+      self.sock.sendto(json.dumps({"reset": self.trial, "spawn_s": spawn_s}).encode(), ("127.0.0.1", CAR_PORT_BASE + car))
+    fault = f", signals fail ({self.sc.fault}) at {self.fault_at:.1f} s" if self.fault_at >= 0 else ""
+    print(f"[director] trial {self.trial} started: {self.sc.title}{fault}", flush=True)
 
   def trial_over(self, t: float) -> bool:
     live = [p for p in self.poses.values() if p.get("trial") == self.trial]
@@ -87,10 +99,14 @@ class Director:
       r = self.cmap.routes[p["route"]]
       o = self.outcome["cars"].setdefault(c, {"route": p["route"], "crossed": False, "entered_at": None, "min_v_before_line": 99.0,
                                               "engaged_at_entry": None, "entry_aspect": None, "red_entry": False, "l3_mode_at_entry": None,
-                                              "box_stop": False, "box_stop_at": None, "box_stop_em": False, "crossed_at": None})
+                                              "box_stop": False, "box_stop_at": None, "box_stop_em": False, "crossed_at": None,
+                                              "stopped_at": None})
       l3 = p.get("l3") if isinstance(p.get("l3"), dict) else {}
       if p["s"] < r.stop_line_s:
         o["min_v_before_line"] = min(o["min_v_before_line"], round(p["v"], 2))
+      front = p["s"] + CAR_HALF[1]
+      if o["stopped_at"] is None and p["v"] < LINE_STOP_V and 0.0 <= r.stop_line_s - front < LINE_STOP_D:
+        o["stopped_at"] = round(t, 2)  # first standstill at its line: its arrival for the give-way order
       if o["entered_at"] is None and p["s"] >= r.junction_s[0]:
         o["entered_at"] = round(t, 1)
         o["engaged_at_entry"] = p["engaged"]
@@ -143,12 +159,21 @@ class Director:
     crossed = sum(c["crossed"] for c in o["cars"].values())
     stopped = [c for c, v in o["cars"].items() if v["stopped_for_lights"]]
     o["valid"] = all(v["engaged_at_entry"] in (True, None) for v in o["cars"].values()) and len(o["cars"]) == self.cars
+    judged = {f"op{c}": {"route": v["route"], "phase": self.cmap.routes[v["route"]].phase, "stopped_at": v["stopped_at"],
+                         "entered_at": v["entered_at"], "crossed": v["crossed"], "box_stop": v["box_stop"] and not v["box_stop_em"]}
+              for c, v in o["cars"].items()}
+    o["verdict"] = verdict(self.sc, judged, o["fault_t"], len(o["collisions"]), o["deadlock"])
+    if len(o["cars"]) < self.cars:
+      o["verdict"] = {"passed": False, "failures": [f"only {len(o['cars'])}/{self.cars} cars reported"]}
     extra = [f"{k}: {v}" for k, v in (("red entries", [c for c, v in o["cars"].items() if v["red_entry"]]),
                                        ("box stops", [c for c, v in o["cars"].items() if v["box_stop"]])) if v]
     extra += ["DEADLOCK"] if o["deadlock"] else []
     extra += [f"TIMEOUT (not through after {self.trial_len:.0f} s)"] if o["timeout"] else [f"cleared in {o['t_clear']:.1f} s"]
     print(f"[director] trial {self.trial} done: {crossed}/{self.cars} crossed, {len(o['collisions'])} collisions, stopped: {stopped}"
           + "".join(f", {e}" for e in extra), flush=True)
+    v = o["verdict"]
+    print(f"[director] trial {self.trial} {self.sc.name}: {'PASS' if v['passed'] else 'FAIL'}" + "".join(f"\n  - {f}" for f in v["failures"])
+          + ("" if o["valid"] else "  (not every openpilot was engaged: invalid)"), flush=True)
     if os.path.dirname(self.out):
       os.makedirs(os.path.dirname(self.out), exist_ok=True)
     with open(self.out, "w") as f:
@@ -179,8 +204,9 @@ class Director:
         self._wait_engaged()
         self.start_trial()
       t = now - self.trial_t0
-      if 0 <= self.fault_at <= t:
+      if 0 <= self.fault_at <= t and not self.signals.fault:
         self.signals.fault = True
+        self.outcome["fault_t"] = round(t, 2)
       self._show_signals(t)
       self.broadcast_world()
       self.judge(t)
@@ -286,7 +312,8 @@ class Director:
 
   def _hud(self, t: float) -> None:
     ph = self.shown_phases
-    state = "FAULT: green both ways" if self.signals.fault else "normal"
+    state = {"stuck_green": "FAULT: green both ways", "dark": "FAULT: lights out (power cut)"}[self.signals.fault_mode] if self.signals.fault \
+      else "normal"
     collided = {c for hit in self.outcome.get("collisions", []) for c in hit["cars"]}
     cars = []
     for c in range(self.cars):
@@ -301,7 +328,8 @@ class Director:
       (f"crossroads (UK)   trial {self.trial}   t {t:5.1f} s   signals {state}   N-S {ph.get('NS', '?')}   E-W {ph.get('EW', '?')}",
        [1.0, 0.4, 0.3] if self.signals.fault else [1.0, 1.0, 1.0]),
       ("   ".join(cars), [0.85, 0.85, 0.85]),
-      (f"collisions this trial {len(self.outcome.get('collisions', []))}   all trials {total} in {len(self.results)}", [1.0, 0.75, 0.3]),
+      ((f"collisions this trial {len(self.outcome.get('collisions', []))}   all trials {total} in {len(self.results)}   scenario {self.sc.name}: " +
+        f"{sum(r['verdict']['passed'] for r in self.results)}/{len(self.results)} passed"), [1.0, 0.75, 0.3]),
     ]
     self.api.batch([{"action": "hud_text", "id": f"xr{i}", "text": s, "pos": [0.27, 0.015 + 0.03 * i], "color": c, "scale": 1.0}
                     for i, (s, c) in enumerate(lines)])
@@ -311,7 +339,8 @@ def main():
   ap = argparse.ArgumentParser(description=__doc__)
   ap.add_argument("--map", required=True, help="ZoomEngine assets/maps/crossroads.built.json")
   ap.add_argument("--cars", type=int, default=len(ROUTES))
-  ap.add_argument("--fault-at", type=float, default=6.0, help="seconds into each trial the signals stick on green both ways (<0: never)")
+  ap.add_argument("--scenario", default="stuck_green", choices=sorted(SCENARIOS), help="what fails, how the cars arrive, what's judged")
+  ap.add_argument("--fault-at", type=float, default=None, help="seconds into each trial the signals fail (<0: never; default: the scenario's)")
   ap.add_argument("--trial-len", type=float, default=None, help="seconds per trial (default 45, or 90 with --l3-mask: L3 traffic takes " +
                   "~40-60 s to clear a failed junction under the unmarked rule)")
   ap.add_argument("--seed", type=int, default=None, help="seeds python random (the director has no randomness yet), stored in every trial's results")
@@ -321,7 +350,8 @@ def main():
   args = ap.parse_args()
   if args.trial_len is None:
     args.trial_len = 90.0 if args.l3_mask else 45.0
-  Director(args.map, args.cars, args.fault_at, args.trial_len, seed=args.seed, trials=args.trials, out=args.out, l3_mask=args.l3_mask).run()
+  Director(args.map, args.cars, args.fault_at, args.trial_len, seed=args.seed, trials=args.trials, out=args.out, l3_mask=args.l3_mask,
+           scenario=args.scenario).run()
 
 
 if __name__ == "__main__":

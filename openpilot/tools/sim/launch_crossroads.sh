@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Crossroads: CARS openpilot-driven cars (default 4, one per approach), each with its own openpilot (OPENPILOT_PREFIX) and
-# bridge, crossing a UK signalised junction whose signals stick on green both ways during every trial.
+# bridge, crossing a UK signalised junction whose signals fail during every trial (SCENARIO).
 #   ZOOMENGINE_DIR  ZoomEngine checkout with the road kit (default ~/Documents/zoom/ZoomEngine-main)
 #   CARS            number of openpilot cars, 1-4 (default 4)
-#   FAULT_AT        seconds into each trial the signals fail (default 6, negative = never)
+#   SCENARIO        stuck_green (default: signals stuck on green both ways at 6 s) or uk_lights_out (Highway Code rule 176:
+#                   a power cut turns every signal dark 3-10 s in, cars arrive staggered; judged on stopping and arrival order)
+#   FAULT_AT        seconds into each trial the signals fail (default: the scenario's, negative = never)
 #   L3              1: the cars in L3_MASK run the sim-only L3 research layer (default unset: plain openpilot)
 #   L3_MASK         comma list of car indices that run L3 when L3=1 (default all, e.g. 0,2)
 #   TRIAL_LEN       seconds per trial (default 45, 90 when L3=1: L3 traffic needs ~40-60 s to clear a failed junction)
@@ -54,7 +56,8 @@ ENGINE=$!
 PIDS+=($ENGINE)
 sleep 5
 
-DIRECTOR_ARGS=(--map "$MAP" --cars "$CARS" --fault-at "${FAULT_AT:-6}")
+DIRECTOR_ARGS=(--map "$MAP" --cars "$CARS" --scenario "${SCENARIO:-stuck_green}")
+if [[ -n "${FAULT_AT:-}" ]]; then DIRECTOR_ARGS+=(--fault-at "$FAULT_AT"); fi
 if [[ -n "${TRIALS:-}" ]]; then DIRECTOR_ARGS+=(--trials "$TRIALS"); fi
 if [[ -n "${TRIAL_LEN:-}" ]]; then DIRECTOR_ARGS+=(--trial-len "$TRIAL_LEN"); fi
 if [[ -n "${SEED:-}" ]]; then DIRECTOR_ARGS+=(--seed "$SEED"); fi

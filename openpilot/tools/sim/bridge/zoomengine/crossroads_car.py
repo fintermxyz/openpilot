@@ -153,6 +153,8 @@ class CrossroadsCarWorld(ZoomEngineWorld):
         continue
       if "reset" in msg and msg["reset"] != self.trial:
         self.trial = msg["reset"]
+        # the scenario may stagger the arrivals: this trial's spawn along the route (default the map's)
+        self.START_S = float(msg.get("spawn_s", self.cmap.routes[self.route_name].spawn_s))
         self.parked = False
         self.reset()  # ego state + the engine's physics car back to the spawn
         reset = True

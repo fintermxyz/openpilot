@@ -19,8 +19,20 @@ simulated car through the bridge (ZoomEngine `vehicle_input`), never `carControl
 driver monitoring unchanged (`tools/check_no_core_diff.sh`). The cooperative feed is ground truth from the director (an
 oracle, labelled as such): the 40 deg road camera cannot see cross traffic.
 
+## Scenarios
+
+`SCENARIO=` picks what fails, how the cars arrive and what each trial is judged on (`bridge/zoomengine/crossroads_scenarios.py`,
+shared by the engine's director and the kinematic harness); every trial ends with PASS / FAIL and the failed checks.
+
+| scenario | what happens | judged on |
+|---|---|---|
+| `stuck_green` (default) | the signals stick on green both ways 6 s into the trial | no collision, everyone through, no stop in the box, no deadlock |
+| `uk_lights_out` | **Highway Code rule 176**, traffic lights not working: a power cut turns every head dark 3-10 s in (seeded per trial), cars spawn up to 45 m apart so they arrive staggered | the above, plus every car arriving after the failure stops at its line, and of two cars on conflicting roads the one that stopped first goes first (opposite cars may go together) |
+
 ``` bash
 L3=1 openpilot/tools/sim/launch_crossroads.sh                  # 4 openpilots + L3 at the crossroads, signals stuck green
+SCENARIO=uk_lights_out L3=1 TRIALS=6 openpilot/tools/sim/launch_crossroads.sh   # rule 176: lights out, staggered arrivals
+L3=1 python -m openpilot.tools.sim.l3.runner.scenario_campaign uk_lights_out -k 500   # the same scenario, kinematic harness
 L3=1 L3_MASK=0,2 openpilot/tools/sim/launch_crossroads.sh      # L3 on cars 0 and 2 only
 L3=1 TRIALS=6 L3_LOG_DIR=/tmp/l3run openpilot/tools/sim/launch_crossroads.sh   # 6 trials, per-car arbiter logs
 python -m pytest -q openpilot/tools/sim/l3/tests               # unit, property and closed-loop tests

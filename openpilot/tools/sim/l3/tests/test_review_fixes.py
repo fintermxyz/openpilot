@@ -278,7 +278,8 @@ def test_director_records_clear_times_and_timeouts(cmap, tmp_path):
   d = cd.Director.__new__(cd.Director)
   d.cmap, d.cars, d.trial, d.trial_len, d.out, d.results = cmap, 2, 0, 90.0, str(tmp_path / "res.json"), []
   d.signals, d.shown_phases, d.still_since, d.poses = SimpleNamespace(fault=True), {"NS": "green", "EW": "green"}, None, {}
-  d.outcome = {"trial": 0, "collisions": [], "cars": {}, "deadlock": False, "deadlock_at": None}
+  d.outcome = {"trial": 0, "collisions": [], "cars": {}, "deadlock": False, "deadlock_at": None, "fault_t": 6.0}
+  d.sc = cd.SCENARIOS["stuck_green"]
   import time as _time
 
   def pose(c, route, s, v):

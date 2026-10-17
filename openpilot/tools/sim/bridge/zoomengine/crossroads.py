@@ -107,17 +107,20 @@ def lamp_commands(sig_id: str, aspect: str) -> list[dict]:
 
 class SignalController:
   """UK two-phase cycle: green -> amber (3 s) -> all red -> red+amber (2 s) -> green for the other phase.
-  fault 'stuck_green': from fault_at seconds every head shows green (conflicting greens)."""
+  faults (fault_mode, active while fault is set): 'stuck_green' every head shows green (conflicting greens), 'dark' every head
+  is out (a power cut)."""
   def __init__(self, green: float = 12.0, amber: float = 3.0, all_red: float = 2.0, red_amber: float = 2.0):
     self.seq = []  # (duration, NS aspect, EW aspect)
     for a, b in (("NS", "EW"), ("EW", "NS")):
       self.seq += [(green, a, "green"), (amber, a, "amber"), (all_red, a, "red"), (red_amber, b, "red_amber")]
     self.cycle = sum(d for d, _, _ in self.seq)
     self.fault = False
+    self.fault_mode = "stuck_green"
 
   def aspects(self, t: float) -> dict[str, str]:
     if self.fault:
-      return {"NS": "green", "EW": "green"}
+      a = {"stuck_green": "green", "dark": "dark"}[self.fault_mode]
+      return {"NS": a, "EW": a}
     t %= self.cycle
     for dur, phase, aspect in self.seq:
       if t < dur:

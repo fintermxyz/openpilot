@@ -255,10 +255,13 @@ def run_episode(seed: int, fault: str = "stuck_green", fault_at: float = 6.0, l3
         rec["min_v_before_line"] = min(rec["min_v_before_line"], c.v)
         if c.v < 0.5 and r.stop_line_s - front < 6.0:
           rec["stopped_before_line"] = True
+          rec.setdefault("t_stop_line", round(t, 2))  # first standstill at the line: its arrival for the give-way order
       prev_front = (c.s_hist[-2][1] if len(c.s_hist) > 1 else c.s) + CAR_HALF[1]
       if prev_front < r.stop_line_s <= front and shown[r.phase] in ("red", "red_amber"):
         rec["red_entry"] = True
         rec["red_entry_t"] = round(t, 2)
+      if "t_enter" not in rec and front >= r.junction_s[0]:
+        rec["t_enter"] = round(t, 2)
       if rec["t_cross"] is None and c.s >= r.junction_s[1] + CAR_HALF[1]:
         rec["t_cross"] = round(t, 2)
         t_last_cross = t
