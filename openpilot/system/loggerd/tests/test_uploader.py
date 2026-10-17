@@ -1,4 +1,3 @@
-import os
 import threading
 import logging
 import json
@@ -6,6 +5,7 @@ from pathlib import Path
 from openpilot.common.hardware.hw import Paths
 
 from openpilot.common.swaglog import cloudlog
+from openpilot.system.loggerd.xattr_cache import _getxattr
 from openpilot.system.loggerd.uploader import clear_locks, main, Uploader, UPLOAD_ATTR_NAME, UPLOAD_ATTR_VALUE
 
 from openpilot.system.loggerd.tests.loggerd_tests_common import UploaderTestCase
@@ -88,7 +88,7 @@ class TestUploader(UploaderTestCase):
     assert not len(log_handler.upload_order) < len(exp_order), "Some files failed to upload"
     assert not len(log_handler.upload_order) > len(exp_order), "Some files were uploaded twice"
     for f_path in exp_order:
-      assert os.getxattr((Path(Paths.log_root()) / f_path).with_suffix(""), UPLOAD_ATTR_NAME) == UPLOAD_ATTR_VALUE, "All files not uploaded"
+      assert _getxattr(str((Path(Paths.log_root()) / f_path).with_suffix("")), UPLOAD_ATTR_NAME) == UPLOAD_ATTR_VALUE, "All files not uploaded"
 
     assert log_handler.upload_order == exp_order, "Files uploaded in wrong order"
 
@@ -104,7 +104,7 @@ class TestUploader(UploaderTestCase):
     assert not len(log_handler.upload_order) < len(exp_order), "Some files failed to upload"
     assert not len(log_handler.upload_order) > len(exp_order), "Some files were uploaded twice"
     for f_path in exp_order:
-      assert os.getxattr((Path(Paths.log_root()) / f_path).with_suffix(""), UPLOAD_ATTR_NAME) == UPLOAD_ATTR_VALUE, "All files not uploaded"
+      assert _getxattr(str((Path(Paths.log_root()) / f_path).with_suffix("")), UPLOAD_ATTR_NAME) == UPLOAD_ATTR_VALUE, "All files not uploaded"
 
     assert log_handler.upload_order == exp_order, "Files uploaded in wrong order"
 
@@ -121,7 +121,7 @@ class TestUploader(UploaderTestCase):
     assert not len(log_handler.upload_ignored) < len(exp_order), "Some files failed to ignore"
     assert not len(log_handler.upload_ignored) > len(exp_order), "Some files were ignored twice"
     for f_path in exp_order:
-      assert os.getxattr((Path(Paths.log_root()) / f_path).with_suffix(""), UPLOAD_ATTR_NAME) == UPLOAD_ATTR_VALUE, "All files not ignored"
+      assert _getxattr(str((Path(Paths.log_root()) / f_path).with_suffix("")), UPLOAD_ATTR_NAME) == UPLOAD_ATTR_VALUE, "All files not ignored"
 
     assert log_handler.upload_ignored == exp_order, "Files ignored in wrong order"
 
@@ -145,7 +145,7 @@ class TestUploader(UploaderTestCase):
     assert not len(log_handler.upload_order) < len(exp_order), "Some files failed to upload"
     assert not len(log_handler.upload_order) > len(exp_order), "Some files were uploaded twice"
     for f_path in exp_order:
-      assert os.getxattr((Path(Paths.log_root()) / f_path).with_suffix(""), UPLOAD_ATTR_NAME) == UPLOAD_ATTR_VALUE, "All files not uploaded"
+      assert _getxattr(str((Path(Paths.log_root()) / f_path).with_suffix("")), UPLOAD_ATTR_NAME) == UPLOAD_ATTR_VALUE, "All files not uploaded"
 
     assert log_handler.upload_order == exp_order, "Files uploaded in wrong order"
 

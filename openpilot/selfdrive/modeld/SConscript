@@ -14,6 +14,10 @@ Import('env', 'arch')
 if arch not in ('comma_arm64', 'Darwin') and ctypes.util.find_library('LLVM') is None:
   print("\033[93mmodeld: LLVM not found, skipping tinygrad model compilation. Install LLVM to compile models.\033[0m")
   Return()
+# DEV=METAL still uses LLVM for host-side kernels, tinygrad only looks for Homebrew's libLLVM
+if arch == 'Darwin' and not any(os.path.isfile(f'/opt/homebrew/opt/llvm@{v}/lib/libLLVM.dylib') for v in range(14, 22)):
+  print("\033[93mmodeld: Homebrew LLVM not found, skipping tinygrad model compilation. Run `brew install llvm@21` to compile models.\033[0m")
+  Return()
 
 lenv = env.Clone()
 lenv.PrependENVPath('PYTHONPATH', Dir('#tinygrad_repo').abspath)

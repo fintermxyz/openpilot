@@ -133,6 +133,13 @@ if [[ "$OSTYPE" == "linux-gnu"* ]]; then
   install_linux_deps
   echo "[ ] installed system dependencies t=$SECONDS"
 elif [[ "$OSTYPE" == "darwin"* ]]; then
+  # tinygrad needs Homebrew LLVM, DEV=METAL still compiles host-side kernels with it
+  if command -v brew > /dev/null 2>&1; then
+    brew list --versions llvm@21 > /dev/null 2>&1 || brew install llvm@21
+    echo "[ ] installed system dependencies t=$SECONDS"
+  else
+    echo "Homebrew not found, install it from https://brew.sh then run: brew install llvm@21"
+  fi
   if [[ $SHELL == "/bin/zsh" ]]; then
     RC_FILE="$HOME/.zshrc"
   elif [[ $SHELL == "/bin/bash" ]]; then

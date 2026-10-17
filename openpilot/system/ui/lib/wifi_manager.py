@@ -167,7 +167,7 @@ class WifiManager:
       self._conn_monitor = open_dbus_connection_blocking(bus="SYSTEM")  # used by state monitor thread
       self._nm = DBusAddress(NM_PATH, bus_name=NM, interface=NM_IFACE)
     except FileNotFoundError:
-      cloudlog.exception("Failed to connect to system D-Bus")
+      cloudlog.warning("System D-Bus not available, WifiManager disabled")
       self._router_main = None
       self._conn_monitor = None
       self._exit = True

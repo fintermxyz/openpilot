@@ -46,7 +46,12 @@ class MockWebsocket:
   def __init__(self, recv_queue, send_queue):
     self.recv_queue = recv_queue
     self.send_queue = send_queue
-    self.sock = socket.socket()
+    # connected socket with a closed peer, so it's immediately readable (EOF) on all platforms
+    listener = socket.create_server(('127.0.0.1', 0))
+    self.sock = socket.create_connection(listener.getsockname())
+    peer, _ = listener.accept()
+    peer.close()
+    listener.close()
 
   def recv(self):
     data = self.recv_queue.get()

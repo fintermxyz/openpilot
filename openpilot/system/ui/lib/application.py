@@ -298,6 +298,8 @@ class GuiApplication:
       rl.set_config_flags(flags)
 
       rl.init_window(self._scaled_width, self._scaled_height, title)
+      if not rl.is_window_ready():
+        raise RuntimeError("raylib failed to create a window, no display available (on macOS, wake the display e.g. with `caffeinate -u`)")
 
       needs_render_texture = self._scale != 1.0 or BURN_IN_MODE or RECORD
       if self._scale != 1.0:
@@ -883,6 +885,8 @@ class GuiApplication:
   def _calculate_auto_scale(self) -> float:
      # Create temporary window to query monitor info
     rl.init_window(1, 1, "")
+    if not rl.is_window_ready():
+      return 1.0
     w, h = rl.get_monitor_width(0), rl.get_monitor_height(0)
     rl.close_window()
 

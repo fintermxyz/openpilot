@@ -134,7 +134,8 @@ class TestAthenadMethods(OpenpilotTestCase):
     with self.assertRaises(TimeoutError) as _:
       dispatcher["getMessage"]("controlsState")
 
-    end_event = multiprocessing.Event()
+    ctx = multiprocessing.get_context('fork')
+    end_event = ctx.Event()
 
     pub_sock = messaging.pub_sock("deviceState")
 
@@ -144,7 +145,7 @@ class TestAthenadMethods(OpenpilotTestCase):
         pub_sock.send(msg.to_bytes())
         time.sleep(0.01)
 
-    p = multiprocessing.Process(target=send_deviceState)
+    p = ctx.Process(target=send_deviceState)
     p.start()
     time.sleep(0.1)
     try:
