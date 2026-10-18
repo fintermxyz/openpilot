@@ -75,6 +75,19 @@ def car_commands(cid: str, kind: str, color, x: float, z: float, psi: float, sen
   return cmds
 
 
+def car_lite_commands(cid: str, kind: str, color, x: float, z: float, psi: float) -> list[dict]:
+  """a parked car in 4 objects (body, cabin, one cylinder per axle for both its wheels): for scenery by the hundred"""
+  hw, hh, hl, y, (cw, ch, cl, cy, cz), wr = KINDS[kind]
+  cmds = [{"action": "create", "type": "cube", "id": cid, "position": [x, y, z], "rotation": [0, deg(psi), 0], "scale": [hw, hh, hl],
+           "color": color, "metallic": 0.6, "roughness": 0.3},
+          {"action": "create", "type": "cube", "id": f"{cid}_cabin", "parent": cid, "position": [0, cy, cz], "scale": [cw, ch, cl],
+           "color": [0.07, 0.08, 0.1], "metallic": 0.9, "roughness": 0.08}]
+  for i, az in enumerate((-hl * 0.62, hl * 0.62)):
+    cmds.append({"action": "create", "type": "cylinder", "id": f"{cid}_axle{i}", "parent": cid, "position": [0, wr - y, az],
+                 "rotation": [0, 0, 90], "radius": wr, "height": 2 * hw - 0.1, "segments": 12, "color": [0.04, 0.04, 0.04], "roughness": 0.9})
+  return cmds
+
+
 def road_commands(track: Track) -> list[dict]:
   cmds: list[dict] = []
 

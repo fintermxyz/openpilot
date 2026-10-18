@@ -24,7 +24,7 @@ CAR_FINGERPRINT = "HONDA_CIVIC_2022"
 STEER_RATE = 300.  # deg/s of steering wheel
 GRAVITY = 9.81
 
-CAM_HEIGHT = 1.22      # comma device height above the road
+CAM_HEIGHT = 1.32      # camera height above the road (a comma device on a Civic is ~1.22; raised 0.1 m to try the model with a higher view)
 CAM_FORWARD = 0.6      # mount position ahead of the car center
 EGO_START_S = 100.0
 EGO_START_SPEED = 20.0
@@ -156,7 +156,7 @@ class ZoomEngineWorld(World):
       L, cx, cz = 3000.0, 650.0, 600.0
       api.send({"action": "mesh_collider", "id": "ground_collider", "material": "default", "indices": [0, 2, 1, 0, 3, 2],
                 "verts": [cx - L, 0, cz - L, cx + L, 0, cz - L, cx + L, 0, cz + L, cx - L, 0, cz + L]})
-    else:
+    elif not hasattr(self.map, "collider_commands"):   # road-kit maps lay their colliders with their scene
       for i, st in enumerate(self.map.level["statics"]):
         if not st.get("dynamic"):
           api.send({"action": "mesh_collider", "id": f"collider{i}", "gltf": os.path.join(self.map.dir, st["path"]),

@@ -3,7 +3,7 @@ import socket
 import time
 from multiprocessing import Queue
 
-from openpilot.tools.sim.bridge.zoomengine.crossroads import ROUTES, CrossroadsMap
+from openpilot.tools.sim.bridge.zoomengine.crossroads import ROUTES, CrossroadsMap, map_is_left_hand
 from openpilot.tools.sim.bridge.zoomengine.scene import car_commands
 from openpilot.tools.sim.bridge.zoomengine.zoomengine_bridge import ZoomEngineBridge
 from openpilot.tools.sim.bridge.zoomengine.zoomengine_world import CAM_HEIGHT, CAR_Y, ENGINE_HZ, ZoomEngineWorld
@@ -24,9 +24,8 @@ PIPS = ([0.01, 0.10, PIP_W, PIP_H], [0.75, 0.10, PIP_W, PIP_H], [0.01, 0.97 - PI
 
 
 class CrossroadsCarWorld(ZoomEngineWorld):
-  # the camera sits just ahead of the bumper: the other cars' cameras must see this car's body, so it can't be hidden
-  # from sensor views, and a camera inside it would see its own bonnet from the inside
-  CAM_FORWARD_M = 2.4
+  # the camera is where the single-car sim (and a real comma device) has it: on the windscreen, CAM_FORWARD ahead of the
+  # car centre. A camera out at the bumper sees each bend as if the car were further round it, and the model turns early
 
   def __init__(self, status_q, car: int, map_path: str, port: int = 9090):
     self.car = car
@@ -71,9 +70,12 @@ class CrossroadsCarWorld(ZoomEngineWorld):
     api.send(self._vehicle_spawn_command("vehicle"))  # the engine's physics Civic drives this body
     api.send({"action": "sensor_camera", "id": self.CAM_IDS[0], "attach": self.EGO_ID, "offset": [0, CAM_HEIGHT - CAR_Y, self.CAM_FORWARD_M],
               "yaw": 0, "pitch": 0, "width": W, "height": H, "hz": 20, "hfov": 40, "shm": self.SHM_PATHS[0],
-              "format": "nv12", "nv12": list(get_nv12_info(W, H)), "pip": PIPS[self.car],
+              "format": "nv12", "nv12": list(get_nv12_info(W, H)), "pip": self._road_pip(),
               "label": f"car {self.car + 1} {self.route_name.replace('_', ' to ')} (openpilot {self.car + 1})"})
     print(f"---- crossroads car {self.car} ({self.route_name}) ready, route {self.track.length:.0f} m ----", flush=True)
+
+  def _road_pip(self) -> list[float]:
+    return PIPS[self.car]
 
   def _poll_input(self, q: dict) -> None:
     pass  # the engine window's keys belong to the director
@@ -131,4 +133,5 @@ class CrossroadsCarBridge(ZoomEngineBridge):
     # four openpilots share the machine: one IMU sample per 100 Hz tick and GPS at 10 Hz (a real receiver's rate) instead of
     # the default 5x / 10x repeats, which kept each car's locationd busy
     SimulatedSensors.IMU_REPEAT, SimulatedSensors.GPS_REPEAT, SimulatedSensors.GPS_EVERY = 1, 1, 10
+    SimulatedSensors.IS_RHD = map_is_left_hand(self.map_path)   # UK crossroads: a right-hand-drive car
     return CrossroadsCarWorld(queue, self.car, self.map_path, port=self.port)

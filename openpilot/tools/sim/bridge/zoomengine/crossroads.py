@@ -10,6 +10,12 @@ from openpilot.tools.sim.bridge.zoomengine.track import Track
 # A map built from ZoomEngine's road kit (tools/roadkit/assemble.py -> assets/maps/<name>.built.json): pre-built road
 # sections placed by their connectors, signal and stop line positions and the straight-across lane routes.
 
+def map_is_left_hand(built_json: str) -> bool:
+  """a road-kit map's traffic drives on the left (UK): its cars are right-hand drive"""
+  with open(built_json) as f:
+    return json.load(f).get("drive_side", "left") == "left"
+
+
 # one openpilot car per approach, each driving straight across
 ROUTES = ("N_S", "S_N", "E_W", "W_E")
 CAR_HALF = (0.92, 2.3)  # sedan footprint half width / half length
@@ -44,13 +50,14 @@ class CrossroadsMap:
     cmds = []
     for i, st in enumerate(self.data["statics"]):
       cmds.append({"action": "mesh_collider", "id": f"kit_collider{i}", "gltf": os.path.join(self.root, st["path"]),
-                   "materials": ["asphalt", "kerb", "footway"], "position": st["position"], "rotation": st.get("rotation", [0, 0, 0]),
+                   "materials": ["asphalt", "kerb", "footway", "parapet", "pier"], "position": st["position"], "rotation": st.get("rotation", [0, 0, 0]),
                    "scale": st.get("scale", [1, 1, 1]), "material": "default"})
     g = self.data.get("ground")
     if g:
       w, d, y = float(g["size"][0]) / 2, float(g["size"][1]) / 2, float(g.get("y", -0.02))
+      cx, cz = float(g.get("center", [0.0])[0]), float(g.get("center", [0.0, 0.0, 0.0])[2])   # the map's middle, not the origin
       cmds.append({"action": "mesh_collider", "id": "ground_collider", "material": "default", "indices": [0, 2, 1, 0, 3, 2],
-                   "verts": [-w, y, -d, w, y, -d, w, y, d, -w, y, d]})
+                   "verts": [cx - w, y, cz - d, cx + w, y, cz - d, cx + w, y, cz + d, cx - w, y, cz + d]})
     return cmds
 
   def scene_commands(self) -> list[dict]:
@@ -59,11 +66,16 @@ class CrossroadsMap:
     if g:  # a flat box: the API's plane primitive doesn't render in this scene
       w, d = float(g["size"][0]), float(g["size"][1])
       cmds.append({"action": "create", "type": "cube", "id": "ground", "scale": [w / 2, 0.05, d / 2],
-                   "position": [0.0, float(g.get("y", -0.02)) - 0.05, 0.0], "color": g.get("color", [0.42, 0.55, 0.32]), "roughness": 0.95})
+                   "position": [float(g.get("center", [0.0])[0]), float(g.get("y", -0.02)) - 0.05, float(g.get("center", [0.0, 0.0, 0.0])[2])],
+                   "color": g.get("color", [0.42, 0.55, 0.32]), "roughness": 0.95})
     for i, st in enumerate(self.data["statics"]):
       cmds.append({"action": "create", "type": "gltf", "id": f"kit{i}", "path": os.path.join(self.root, st["path"]),
                    "position": st["position"], "rotation": st.get("rotation", [0, 0, 0]), "scale": st.get("scale", [1, 1, 1])})
     cmds += self.collider_commands()
+    # bridge piers (the map places them clear of every road below): a concrete column up to the deck slab
+    for i, (x, y, z) in enumerate(self.data.get("piers", [])):
+      cmds.append({"action": "create", "type": "cylinder", "id": f"pier{i}", "position": [x, y / 2 - 0.05, z], "radius": 0.7,
+                   "height": y + 0.1, "segments": 14, "color": [0.55, 0.54, 0.51], "roughness": 0.85})
     for sig in self.data["signals"]:
       cmds += signal_commands(sig)
     return cmds

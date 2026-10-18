@@ -18,6 +18,9 @@ class SimulatedSensors:
   IMU_REPEAT = 5
   GPS_REPEAT = 10
   GPS_EVERY = 1  # send GPS on every n-th update
+  # steering wheel on the right (UK and other left-hand-traffic cars): what driver monitoring would report, and what tells
+  # the driving model the traffic convention (modeld: traffic_convention from driverMonitoringState.isRHD)
+  IS_RHD = False
 
   def __init__(self, dual_camera=False):
     self.pm = messaging.PubMaster(['accelerometer', 'gyroscope', 'gpsLocationExternal', 'driverStateV2', 'driverMonitoringState', 'peripheralState'])
@@ -88,6 +91,7 @@ class SimulatedSensors:
   def send_fake_driver_monitoring(self):
     # dmonitoringmodeld output
     dat = messaging.new_message('driverStateV2')
+    dat.driverStateV2.wheelOnRightProb = 1.0 if self.IS_RHD else 0.0
     dat.driverStateV2.leftDriverData.faceOrientation = [0., 0., 0.]
     dat.driverStateV2.leftDriverData.faceProb = 1.0
     dat.driverStateV2.rightDriverData.faceOrientation = [0., 0., 0.]
@@ -102,6 +106,7 @@ class SimulatedSensors:
     dm.visionPolicyState.faceDetected = True
     dm.visionPolicyState.isDistracted = False
     dm.visionPolicyState.awarenessPercent = 100
+    dm.isRHD = self.IS_RHD
     self.pm.send('driverMonitoringState', dat)
 
   def send_camera_images(self, world: 'World'):
